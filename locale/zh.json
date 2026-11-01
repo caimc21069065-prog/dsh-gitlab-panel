@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GitLab 面板",
+    "description": "DeepSeek Harness 的 Git 与 GitLab 侧栏面板：变更、提交图、分支、合并请求、议题、流水线、评审、分诊，以及带审批队列的 Agent 工具。"
+  }
+}
