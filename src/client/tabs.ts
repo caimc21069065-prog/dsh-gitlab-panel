@@ -30,9 +30,11 @@ function write(entries: Entry[]) {
 /** The right Sidebar restores tab ids but not their navigation params; this remembers what each tab opened. */
 export function rememberTab(id: string | undefined, params: PanelParams) {
   if (!id) return
-  const entries = read().filter((entry) => entry.id !== id)
-  entries.push({ id, params, at: Date.now() })
-  write(entries)
+  const entries = read()
+  const previous = entries.find((entry) => entry.id === id)
+  // Bodies and titles call this on every render; only a real navigation writes.
+  if (previous && JSON.stringify(previous.params) === JSON.stringify(params)) return
+  write([...entries.filter((entry) => entry.id !== id), { id, params, at: Date.now() }])
 }
 
 export function forgetTab(id: string | undefined) {

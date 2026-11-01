@@ -194,7 +194,7 @@ export function SearchView(props: { kind: ItemKind; repo: string; cwd: string; s
   }
 
   const rowMenu = (item: SearchItem): MenuEntry[] => [
-    { label: t("Open"), icon: "arrow-left", onSelect: () => openRow(item) },
+    { label: t("Open item"), icon: "arrow-left", onSelect: () => openRow(item) },
     { label: t("Add to chat"), icon: "comment", onSelect: () => void quote(item) },
     { label: t("Ask agent"), icon: "sparkles", onSelect: () => void ask(item) },
     { type: "separator" },
@@ -422,6 +422,8 @@ export function SearchView(props: { kind: ItemKind; repo: string; cwd: string; s
             trigger="text"
             items={[
               ...saved.map((entry) => ({ label: entry.name, icon: "search", onSelect: () => apply(entry.query, ""), hint: "" })),
+              ...(saved.length ? [{ type: "separator" as const }, { type: "header" as const, label: t("Forget a saved search") }] : []),
+              ...saved.map((entry) => ({ label: entry.name, icon: "close", danger: true, onSelect: () => forgetSavedSearch(entry.id), hint: "" })),
               ...(saved.length ? [{ type: "separator" as const }] : []),
               { label: t("Save search"), icon: "plus", onSelect: () => setDialog("save") },
             ]}

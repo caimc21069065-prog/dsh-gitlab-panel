@@ -106,7 +106,7 @@ export function RunPage(props: { repo: string; id: number; onClose?: () => void 
                   <div key={entry.id} className="glp-check-row" data-state={entry.conclusion === "failed" ? "failure" : undefined} onClick={() => setJob(job?.id === entry.id ? undefined : entry)}>
                     <CheckDot state={entry.conclusion === "failed" ? "failure" : entry.conclusion === "success" ? "success" : ["running", "pending", "created"].includes(entry.conclusion) ? "pending" : "none"} />
                     <span className="glp-ellipsis" style={{ flex: 1 }}>{entry.name}</span>
-                    <span className="glp-faint" style={{ fontSize: 10.5 }}>{entry.conclusion || entry.status}</span>
+                    <span className="glp-faint" style={{ fontSize: 10.5 }}>{t(entry.status || entry.conclusion)}</span>
                     <Icon name={job?.id === entry.id ? "chevron-down" : "chevron-right"} size={10} />
                   </div>
                 ))}

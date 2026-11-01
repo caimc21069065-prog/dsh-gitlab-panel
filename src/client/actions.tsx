@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react"
 import { issueBranchName, withClosing } from "../shared/core"
-import type { Branch, CloseReason, Item, ItemKind, Label, RepoMeta } from "../shared/types"
+import type { Branch, CloseReason, Item, ItemKind, Label, MergeRequest, Overview, RepoMeta } from "../shared/types"
 import type { SavedReply, SavedSearch, Prefs } from "./api"
-import { api, errorText, getPrefs, pluginCtx, queryClient, rpc, startAgentSession, toast, updatePrefs, useMeta, usePrefs } from "./api"
+import { api, errorText, getPrefs, keys, openSessionAt, pluginCtx, queryClient, rpc, startAgentSession, toast, updatePrefs, useBranches, useMeta, usePrefs } from "./api"
 import { t } from "./i18n"
 import { Button, Checkbox, Icon, InlineError, LabelChip, Markdown, Menu, Modal, Pill, Segmented, Spinner, TextArea, copyText, type MenuEntry } from "./ui"
 
@@ -63,16 +63,125 @@ export function issueBranchOf(repo: string, branch: string): number | undefined 
   return getPrefs().issueBranches[`${repo}:${branch}`]
 }
 
+/** The branch a previous Start working linked to this issue, when it is remembered. */
+export function branchForIssue(repo: string, number: number): string | undefined {
+  return Object.entries(getPrefs().issueBranches).find(([key, value]) => value === number && key.startsWith(`${repo}:`))?.[0].slice(repo.length + 1)
+}
+
+export function forgetIssueBranch(repo: string, branch: string) {
+  updatePrefs((draft) => {
+    delete draft.issueBranches[`${repo}:${branch}`]
+  })
+}
+
+function refreshGit(cwd: string) {
+  for (const key of [keys.overview(cwd), keys.branches(cwd), keys.outgoing(cwd), keys.mrs(cwd), keys.merged(cwd)]) {
+    void queryClient.invalidateQueries({ queryKey: key })
+  }
+  void queryClient.invalidateQueries({ queryKey: ["log", cwd] })
+}
+
+/**
+ * Deletes a branch whose merge request merged. It goes without a second question only while the branch still points at
+ * what merged; a branch that moved on since needs a force delete, and that is the user's call.
+ */
+async function dropMerged(cwd: string, branch: string, tip: string | undefined, mr: MergeRequest): Promise<boolean> {
+  const force = !!tip && !!mr.sha && mr.sha.startsWith(tip)
+  try {
+    await rpc("deleteBranch", { cwd, name: branch, force })
+    return true
+  } catch (error) {
+    if (!/not fully merged/i.test(errorText(error))) {
+      errorToast(error)
+      return false
+    }
+    const sure = window.confirm(
+      t("Delete {branch} anyway? !{number} merged, but this branch has commits that are not part of it.", { branch, number: mr.number }),
+    )
+    if (!sure) return false
+    try {
+      await rpc("deleteBranch", { cwd, name: branch, force: true })
+      return true
+    } catch (retry) {
+      errorToast(retry)
+      return false
+    }
+  }
+}
+
+/** After this branch's merge request merged: switch to the default branch, pull it, then delete the branch. */
+export async function finishBranch(cwd: string, overview: Overview, mr: MergeRequest): Promise<boolean> {
+  const branch = overview.branch
+  const base = overview.defaultBranch
+  if (!branch || !base) return false
+  if (!window.confirm(t("Switch to {base}, pull it, then delete {branch}?", { base, branch }))) return false
+  const listed = await api.branches(cwd).catch(() => [] as Branch[])
+  const locals = listed.filter((entry) => !entry.remote).map((entry) => entry.name)
+  const has = locals.includes(base)
+  try {
+    await rpc("checkout", { cwd, ref: base, track: has ? null : `${overview.remote?.name ?? "origin"}/${base}` })
+  } catch (error) {
+    errorToast(error)
+    return false
+  }
+  // A default branch just created from the remote's copy is already up to date.
+  if (has && overview.remote) await rpc("pull", { cwd }).catch((error: unknown) => errorToast(error))
+  const tip = listed.find((entry) => !entry.remote && entry.name === branch)?.sha
+  const dropped = await dropMerged(cwd, branch, tip, mr)
+  if (dropped && overview.remote) forgetIssueBranch(overview.remote.path, branch)
+  refreshGit(cwd)
+  if (dropped) toast({ tone: "success", title: t("Finished {branch}", { branch }) })
+  return dropped
+}
+
+/**
+ * After the merge request of a branch checked out in a linked worktree merged: remove that worktree, which is the
+ * folder this session works in, then delete the branch from the main checkout. Local changes ask again.
+ */
+export async function finishWorktree(cwd: string, overview: Overview, mr: MergeRequest, root: string): Promise<boolean> {
+  const branch = overview.branch
+  if (!branch) return false
+  if (!window.confirm(t("Remove the worktree at {cwd} and delete {branch}?", { cwd: overview.root, branch }))) return false
+  const remove = (force: boolean) => rpc("worktreeRemove", { cwd, path: overview.root, force })
+  try {
+    await remove(false)
+  } catch (error) {
+    if (!/modified or untracked|--force/i.test(errorText(error))) {
+      errorToast(error)
+      return false
+    }
+    if (!window.confirm(t("{cwd} still has local changes. Remove it anyway? They are lost.", { cwd: overview.root }))) return false
+    try {
+      await remove(true)
+    } catch (retry) {
+      errorToast(retry)
+      return false
+    }
+  }
+  const tip = (await api.branches(root).catch(() => [] as Branch[])).find((entry) => !entry.remote && entry.name === branch)?.sha
+  const openRoot = { label: t("Open the project root"), run: () => void openSessionAt(root) }
+  const dropped = await dropMerged(root, branch, tip, mr)
+  if (dropped && overview.remote) forgetIssueBranch(overview.remote.path, branch)
+  refreshGit(root)
+  toast(
+    dropped
+      ? { tone: "success", title: t("Finished {branch}", { branch }), action: openRoot }
+      : { tone: "info", title: t("Worktree removed"), action: openRoot },
+  )
+  return dropped
+}
+
 export function itemQuote(item: Item) {
   const head = `${item.kind === "mr" ? "Merge request" : "Issue"} ${item.repo}${item.kind === "mr" ? "!" : "#"}${item.number}: ${item.title}`
   return [`> ${head}`, `> ${item.url}`, "", item.body.slice(0, 3000)].join("\n")
 }
 
-export async function askAboutItems(sessionID: string, cwd: string, label: string, items: { number: number; title: string; state: string; url: string }[]) {
+export async function askAboutItems(sessionID: string, cwd: string, label: string, items: { number: number; kind: ItemKind; title: string; state: string; url: string }[]) {
   const text = [
     label,
     "",
-    ...items.map((item) => `- #${item.number} (${item.state.toLowerCase()}) ${item.title} — ${item.url}`),
+    // GitLab numbers issues and merge requests separately, so the agent needs the mark to tell them apart.
+    ...items.map((item) => `- ${item.kind === "mr" ? "!" : "#"}${item.number} (${item.state.toLowerCase()}) ${item.title} — ${item.url}`),
     "",
     "Help me decide what to do with them.",
   ].join("\n")
@@ -757,21 +866,25 @@ export function MergeDialog(props: { open: boolean; repo: string; number: number
 }
 
 export function StartWorkDialog(props: { open: boolean; item: Item; cwd: string; defaultBranch: string | null; onClose: () => void; onDone: () => void }) {
-  const branches = useMemo(() => [] as Branch[], [])
-  void branches
+  const local = useBranches(props.cwd, props.open).data ?? []
   const [branch, setBranch] = useState("")
   const [base, setBase] = useState(props.defaultBranch ?? "main")
   const [where, setWhere] = useState<"worktree" | "checkout">("worktree")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  const linked = useMemo(() => branchForIssue(props.item.repo, props.item.number), [props.item])
   useEffect(() => {
     if (props.open) {
-      setBranch(issueBranchName(props.item.number, props.item.title))
+      setBranch(linked ?? issueBranchName(props.item.number, props.item.title))
       setBase(props.defaultBranch ?? "main")
       setWhere("worktree")
       setError(undefined)
     }
-  }, [props.open, props.item, props.defaultBranch])
+  }, [props.open, props.item, props.defaultBranch, linked])
+  const name = branch.trim()
+  const existing = local.find((row: Branch) => !row.remote && row.name === name)
+  // A branch already checked out in another work tree is worked on there, never checked out here.
+  const elsewhere = existing && !existing.current && existing.worktree ? existing.worktree : undefined
   return (
     <Modal
       open={props.open}
@@ -783,26 +896,48 @@ export function StartWorkDialog(props: { open: boolean; item: Item; cwd: string;
           <Button
             variant="primary"
             busy={busy}
-            disabled={!branch.trim()}
+            disabled={!name}
             onClick={async () => {
               setBusy(true)
               setError(undefined)
+              const prompt = itemWorkingPrompt(props.item, name)
+              let stashed = false
+              let switched = false
               try {
                 let target = props.cwd
-                if (where === "worktree") {
-                  const created = await rpc<{ path: string }>("worktreeAdd", { cwd: props.cwd, branch: branch.trim(), base })
-                  target = created.path
+                if (elsewhere || existing?.current) {
+                  target = elsewhere ?? props.cwd
                 } else {
-                  const overview = await api.overview(props.cwd)
-                  if (overview && overview.files.length > 0) await rpc("stash", { cwd: props.cwd })
-                  await rpc("createBranch", { cwd: props.cwd, name: branch.trim(), start: base, checkout: true })
+                  // A new branch starts from the freshly fetched base, not a stale local copy.
+                  if (!existing) await rpc("fetch", { cwd: props.cwd })
+                  if (where === "worktree") {
+                    target = (await rpc<{ path: string }>("worktreeAdd", { cwd: props.cwd, branch: name, base })).path
+                    switched = true
+                  } else {
+                    const overview = await api.overview(props.cwd)
+                    if (overview && overview.files.length > 0) {
+                      await rpc("stash", { cwd: props.cwd })
+                      stashed = true
+                    }
+                    if (existing) await rpc("checkout", { cwd: props.cwd, ref: name, track: null })
+                    else await rpc("createBranch", { cwd: props.cwd, name, start: base, checkout: true })
+                    switched = true
+                  }
                 }
-                rememberIssueBranch(props.item.repo, branch.trim(), props.item.number)
-                await startAgentSession({ cwd: target, prompt: itemWorkingPrompt(props.item, branch.trim()) })
-                toast({ tone: "success", title: t("Session started"), description: `${props.item.repo}${props.item.kind === "mr" ? "!" : "#"}${props.item.number}` })
+                rememberIssueBranch(props.item.repo, name, props.item.number)
+                try {
+                  await startAgentSession({ cwd: target, prompt })
+                  toast({ tone: "success", title: t("Session started"), description: `${props.item.repo}${props.item.kind === "mr" ? "!" : "#"}${props.item.number}` })
+                } catch (reason) {
+                  // The branch is there; only the session is missing, so keep the prompt for the user.
+                  await navigator.clipboard?.writeText(prompt).catch(() => undefined)
+                  toast({ tone: "error", title: t("Branch created, but the session did not start"), description: `${errorText(reason)} ${t("The prompt is on the clipboard.")}` })
+                }
                 props.onClose()
                 props.onDone()
               } catch (reason) {
+                // Never leave the user's work in a stash they did not ask for.
+                if (stashed && !switched) await rpc("stashPop", { cwd: props.cwd }).catch(() => undefined)
                 setError(errorText(reason))
               } finally {
                 setBusy(false)
@@ -823,27 +958,42 @@ export function StartWorkDialog(props: { open: boolean; item: Item; cwd: string;
         <span className="glp-dim">{t("Branch name")}</span>
         <input className="glp-input" value={branch} onChange={(event) => setBranch(event.target.value)} />
       </label>
-      <label className="glp-col" style={{ gap: 4 }}>
-        <span className="glp-dim">{t("Start from")}</span>
-        <select className="glp-select" value={base} onChange={(event) => setBase(event.target.value)}>
-          <option value={props.defaultBranch ?? "main"}>{props.defaultBranch ?? "main"}</option>
-          <option value="HEAD">{t("Current HEAD")}</option>
-        </select>
-      </label>
-      <div className="glp-col" style={{ gap: 4 }}>
-        <span className="glp-dim">{t("Where")}</span>
-        <Segmented
-          value={where}
-          onChange={setWhere}
-          options={[
-            { value: "worktree", label: t("New worktree"), title: t("A separate folder; this checkout and its changes stay as they are") },
-            { value: "checkout", label: t("This checkout"), title: t("Switch here, stashing your changes first") },
-          ]}
-        />
-      </div>
-      <div className="glp-faint" style={{ fontSize: 11 }}>
-        {where === "worktree" ? t("A new worktree is created next to this repository and the agent starts there.") : t("Your changes are stashed before switching. The agent starts in this checkout.")}
-      </div>
+      {elsewhere ? (
+        <div className="glp-faint" style={{ fontSize: 11.5 }}>
+          <Icon name="warning" size={12} /> {t("This branch is already checked out in another work tree; the agent starts there.")}
+          <div style={{ wordBreak: "break-all" }}>{elsewhere}</div>
+        </div>
+      ) : existing?.current ? (
+        <div className="glp-faint" style={{ fontSize: 11.5 }}>{t("This is the current branch; the agent starts in this checkout.")}</div>
+      ) : (
+        <>
+          <label className="glp-col" style={{ gap: 4 }}>
+            <span className="glp-dim">{t("Start from")}</span>
+            <select className="glp-select" value={base} onChange={(event) => setBase(event.target.value)} disabled={!!existing}>
+              <option value={props.defaultBranch ?? "main"}>{props.defaultBranch ?? "main"}</option>
+              <option value="HEAD">{t("Current HEAD")}</option>
+            </select>
+          </label>
+          <div className="glp-col" style={{ gap: 4 }}>
+            <span className="glp-dim">{t("Where")}</span>
+            <Segmented
+              value={where}
+              onChange={setWhere}
+              options={[
+                { value: "worktree", label: t("New worktree"), title: t("A separate folder; this checkout and its changes stay as they are") },
+                { value: "checkout", label: t("This checkout"), title: t("Switch here, stashing your changes first") },
+              ]}
+            />
+          </div>
+          <div className="glp-faint" style={{ fontSize: 11 }}>
+            {existing
+              ? t("This branch already exists and is reused.")
+              : where === "worktree"
+                ? t("A new worktree is created next to this repository and the agent starts there.")
+                : t("Your changes are stashed before switching. The agent starts in this checkout.")}
+          </div>
+        </>
+      )}
     </Modal>
   )
 }
@@ -893,8 +1043,14 @@ export function TriageDialog(props: { open: boolean; repo: string; kind: ItemKin
                 }
                 const { triagePrompt } = await import("../host/plan")
                 const prompt = triagePrompt({ ...triage, numbers: props.numbers })
-                const sessionID = await startAgentSession({ cwd: props.cwd, prompt, open: false })
-                await rpc("agentTriage", { sessionID, triage })
+                // The run's metadata has to exist before the first prompt: proposals are stamped with its round as
+                // they arrive, and one stamped without a round drops out of the triage progress count for good.
+                const sessionID = await startAgentSession({
+                  cwd: props.cwd,
+                  prompt,
+                  open: false,
+                  before: (created) => rpc("agentTriage", { sessionID: created, triage }),
+                })
                 pluginCtx().uiWorkspace?.openSession?.(sessionID)
                 updatePrefs((draft) => {
                   draft.triageRules[props.repo] = rules

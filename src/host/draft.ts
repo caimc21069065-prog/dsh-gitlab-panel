@@ -1,6 +1,7 @@
-import { parsePatch } from "../shared/core"
+// Value imports carry their extension so Node's type-stripping can load this module directly in tests.
+import { parsePatch } from "../shared/core.ts"
 import type { ChangedFile, DiffSide, DraftReview, ReviewEvent } from "../shared/types"
-import { checkRepo } from "./plan"
+import { checkRepo } from "./plan.ts"
 
 export const MAX_COMMENTS = 100
 export const MAX_BODY = 65_536

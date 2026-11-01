@@ -3,8 +3,8 @@ import { cleanupCandidates, type CleanupCandidate } from "../shared/cleanup"
 import { findRefs, issueFromBranch, mrFor } from "../shared/core"
 import { layout, type GraphRow } from "../shared/graph"
 import type { Branch, Commit, FileChange, ItemKind, MergeRequest, Overview } from "../shared/types"
-import { api, errorText, getPrefs, openSessionAt, queryClient, rpc, toast, updatePrefs, useAgent, useBranches, useCommit, useDiff, useInbox, useLog, useMrs, useOverview, usePrefs } from "./api"
-import { CleanupDialog, CreateIssueDialog, CreateMrDialog, NewBranchDialog, PromptDialog, SavedRepliesDialog, openExternal, errorToast } from "./actions"
+import { api, errorText, getPrefs, keys, openSessionAt, queryClient, rpc, toast, updatePrefs, useAgent, useBranches, useCommit, useDiff, useInbox, useItem, useLog, useMrs, useOverview, usePrefs } from "./api"
+import { CleanupDialog, CreateIssueDialog, CreateMrDialog, MergeDialog, NewBranchDialog, PromptDialog, SavedRepliesDialog, finishBranch, finishWorktree, openExternal, errorToast } from "./actions"
 import { DiffView } from "./diff"
 import { t } from "./i18n"
 import { nav, type MainPage, type MainParams } from "./nav"
@@ -23,6 +23,7 @@ export function MainPanel(props: { sessionId: string; cwd: string; params?: Main
   const [view, setView] = useState<"changes" | "history" | "mrs" | "issues">(props.params?.view ?? prefs.view)
   const [branchOpen, setBranchOpen] = useState(false)
   const [dialog, setDialog] = useState<"newBranch" | "createMr" | "createIssue" | "cleanup" | "replies" | "settings" | undefined>()
+  const [mergeMr, setMergeMr] = useState<MergeRequest>()
   const [busy, setBusy] = useState<string>()
   const [cleanup, setCleanup] = useState<CleanupCandidate[]>([])
   const [prompt, setPrompt] = useState<{ title: string; placeholder?: string; initial?: string; onSubmit: (value: string) => Promise<void> }>()
@@ -123,8 +124,9 @@ export function MainPanel(props: { sessionId: string; cwd: string; params?: Main
   const currentIssue = current.remote && current.branch
     ? getPrefs().issueBranches[`${current.remote.path}:${current.branch}`] ?? issueFromBranch(current.branch)
     : undefined
-  const openItem = (kind: ItemKind, number: number) => {
-    if (current.remote) nav.openItem({ repo: current.remote.path, kind, number })
+  const openItem = (kind: ItemKind, number: number, repo?: string) => {
+    const target = repo ?? current.remote?.path
+    if (target) nav.openItem({ repo: target, kind, number })
   }
 
   return (
@@ -176,6 +178,7 @@ export function MainPanel(props: { sessionId: string; cwd: string; params?: Main
           onPickBranch={() => setBranchOpen(true)}
           onRun={run}
           onDialog={setDialog}
+          onMerge={setMergeMr}
           onCleanup={openCleanup}
           onRefresh={refresh}
         />
@@ -197,6 +200,7 @@ export function MainPanel(props: { sessionId: string; cwd: string; params?: Main
 
       <CreateMrDialog open={dialog === "createMr"} cwd={props.cwd} branch={current.branch} defaultBranch={current.defaultBranch} branches={branches.data ?? []} issueNumber={currentIssue} onClose={() => setDialog(undefined)} onDone={refresh} />
       <CreateIssueDialog open={dialog === "createIssue"} cwd={props.cwd} onClose={() => setDialog(undefined)} onDone={refresh} />
+      <MergeDialog open={!!mergeMr} repo={current.remote?.path ?? ""} number={mergeMr?.number ?? 0} onClose={() => setMergeMr(undefined)} onDone={refresh} />
       <NewBranchDialog open={dialog === "newBranch"} cwd={props.cwd} start={current.defaultBranch ?? undefined} onClose={() => setDialog(undefined)} onDone={refresh} />
       <CriticalCleanup open={dialog === "cleanup"} candidates={cleanup} cwd={props.cwd} onClose={() => setDialog(undefined)} onDone={refresh} />
       <SavedRepliesDialog open={dialog === "replies"} repo={current.remote?.path ?? ""} onClose={() => setDialog(undefined)} />
@@ -307,6 +311,7 @@ function BranchBar(props: {
   onPickBranch: () => void
   onRun: (id: string, work: () => Promise<void>) => Promise<void>
   onDialog: (dialog: "createMr" | "newBranch" | "replies") => void
+  onMerge: (mr: MergeRequest) => void
   onCleanup: () => void
   onRefresh: () => void
 }) {
@@ -319,10 +324,46 @@ function BranchBar(props: {
   const mr = mrFor(props.mrs as any, o.branch, o.head, o.defaultBranch) as MergeRequest | undefined
   const issueNumber = issueFromBranch(o.branch ?? "")
   const linked = o.remote ? getPrefs().issueBranches[`${o.remote.path}:${o.branch}`] ?? issueNumber : issueNumber
+  // The issue this branch works on, so the strip can say when a merge already closed it.
+  const issue = useItem(o.remote?.path ?? "", linked ?? 0, "issue")
+  const inWorktree = !!o.worktreeRoot && o.worktreeRoot !== o.root
+  const repo = o.remote?.path ?? ""
+  const next = (): { label: string; icon: string; id: string; run: () => void } | undefined => {
+    if (!mr || !repo) return undefined
+    if (mr.state === "MERGED" && inWorktree) {
+      return { label: t("Finish worktree"), icon: "branch", id: "finish", run: () => void props.onRun("finish", async () => { await finishWorktree(props.cwd, o, mr, o.worktreeRoot) }) }
+    }
+    if (mr.state === "MERGED" && o.defaultBranch) {
+      return { label: t("Finish and switch to {base}", { base: o.defaultBranch }), icon: "branch", id: "finish", run: () => void props.onRun("finish", async () => { await finishBranch(props.cwd, o, mr) }) }
+    }
+    if (o.upstream && o.ahead > 0) {
+      return { label: t("Push"), icon: "cloud-upload", id: "push", run: () => void props.onRun("push", async () => { await rpc("push", { cwd: props.cwd, force: false }) }) }
+    }
+    if (mr.state !== "OPEN") return undefined
+    if (mr.draft) {
+      return { label: t("Mark ready"), icon: "eye", id: "ready", run: () => void props.onRun("ready", async () => { await rpc("setDraft", { repo, number: mr.number, draft: false }); toast({ tone: "success", title: t("Marked ready") }) }) }
+    }
+    // GitLab has no review decision to wait on; approvals and the pipeline are what stand between here and a merge.
+    if (mr.review !== "REVIEW_REQUIRED" && mr.checks !== "failure" && mr.checks !== "pending") {
+      return { label: t("Merge…"), icon: "mr", id: "merge", run: () => props.onMerge(mr) }
+    }
+    return undefined
+  }
+  const step = next()
+  const linkedIssue = issue.data?.kind === "issue" && issue.data.number === linked ? issue.data : undefined
+  // A merge that carried "Closes #N" closes the issue on GitLab; the strip says so instead of showing a stale title.
+  const closedByMerge = mr?.state === "MERGED" && linkedIssue?.state === "CLOSED"
+  useEffect(() => {
+    if (mr?.state !== "MERGED" || !linked || !repo) return
+    void queryClient.invalidateQueries({ queryKey: keys.item(repo, linked, "issue") })
+  }, [mr?.state, linked, repo])
   const menu: MenuEntry[] = [
     { label: t("New branch"), icon: "plus", onSelect: () => props.onDialog("newBranch") },
     { label: t("Create merge request"), icon: "mr", disabled: !o.branch || !o.remote, onSelect: () => props.onDialog("createMr") },
-    { label: t("Force push"), icon: "cloud-upload", disabled: !o.branch || !!props.busy, onSelect: () => void props.onRun("push", async () => { await rpc("push", { cwd: props.cwd, force: true }) }) },
+    { label: t("Force push"), icon: "cloud-upload", disabled: !o.branch || !!props.busy, onSelect: () => {
+      if (!window.confirm(t("Force push {branch} with --force-with-lease? Commits it replaces are lost.", { branch: o.branch ?? "" }))) return
+      void props.onRun("push", async () => { await rpc("push", { cwd: props.cwd, force: true }) })
+    } },
     { type: "separator" },
     { label: t("Stash"), icon: "archive", disabled: o.files.length === 0 || !!props.busy, onSelect: () => void props.onRun("stash", async () => { await rpc("stash", { cwd: props.cwd }); toast({ tone: "success", title: t("Stashed") }) }) },
     { label: t("Pop stash ({count})", { count: o.stashes }), icon: "undo", disabled: o.stashes === 0 || !!props.busy, onSelect: () => void props.onRun("stashPop", async () => { await rpc("stashPop", { cwd: props.cwd }); toast({ tone: "success", title: t("Stash restored") }) }) },
@@ -357,7 +398,7 @@ function BranchBar(props: {
       {o.operation ? (
         <div className="glp-alert" data-tone="info" style={{ margin: 0 }}>
           <Icon name="warning" size={13} />
-          <span style={{ flex: 1 }}>{t(`${o.operation} in progress`)}</span>
+          <span style={{ flex: 1 }}>{t("{operation} in progress", { operation: t(o.operation) })}</span>
           <Button size="sm" variant="ghost" disabled={!!props.busy} onClick={() => { if (window.confirm(t("Abort the operation?"))) void props.onRun("abort", async () => { await rpc("abort", { cwd: props.cwd }) }) }}>{t("Abort")}</Button>
           <Button size="sm" disabled={!!props.busy} onClick={() => void props.onRun("continue", async () => { await rpc("continue", { cwd: props.cwd }) })}>{t("Continue")}</Button>
         </div>
@@ -382,8 +423,13 @@ function BranchBar(props: {
             </>
           )}
           {linked && o.remote ? (
-            <button type="button" className="glp-chip" style={{ border: 0, cursor: "pointer" }} onClick={() => props.onOpenItem("issue", linked)}>#{linked}</button>
+            <button type="button" className="glp-chip glp-ellipsis" style={{ border: 0, cursor: "pointer", maxWidth: 240 }} title={linkedIssue?.title} onClick={() => props.onOpenItem("issue", linked)}>
+              <StateIcon kind="issue" state={linkedIssue?.state ?? "OPEN"} />
+              <span className="glp-faint">#{linked}</span>
+              {closedByMerge ? t("closed by this merge") : linkedIssue?.title ?? ""}
+            </button>
           ) : null}
+          {step ? <Button size="sm" icon={step.icon} busy={props.busy === step.id} disabled={!!props.busy} onClick={step.run}>{step.label}</Button> : null}
         </div>
       ) : null}
     </div>
@@ -431,13 +477,18 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
   }
 
   const commit = async (push: boolean) => {
+    if (groups.conflicts.length > 0) {
+      toast({ tone: "error", title: t("Resolve the conflicts first") })
+      return
+    }
     if (!message.trim() && !amend) {
       toast({ tone: "error", title: t("Write a commit message first") })
       return
     }
     if (amend && o.upstream && o.ahead === 0 && !window.confirm(t("Amending a pushed commit rewrites history. Continue?"))) return
     await act("commit", async () => {
-      await rpc("commit", { cwd: props.cwd, message: message.trim(), amend, all: !staged })
+      // Amending takes only what is staged: sweeping in every change would rewrite history with work the user did not pick.
+      await rpc("commit", { cwd: props.cwd, message: message.trim(), amend, all: !amend && !staged })
       if (push) await rpc("push", { cwd: props.cwd, force: amend })
       setMessage("")
       setAmend(false)
@@ -448,7 +499,8 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
   const fileRow = (file: FileChange, group: string) => {
     const key = `${group}:${file.path}`
     const code = file.conflicted ? "U" : file.untracked ? "?" : group === "staged" ? file.index : file.worktree
-    const canStage = group !== "staged" && !file.conflicted
+    // Staging a conflicted file is how it is marked resolved, so it stays available there.
+    const canStage = group !== "staged"
     const canUnstage = group === "staged" || (group === "changes" && file.index !== ".")
     return (
       <div key={key}>
@@ -457,22 +509,34 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
           <span className="glp-file-status" data-code={code}>{code}</span>
           <span className="glp-file-name" title={file.origPath ? `${file.origPath} → ${file.path}` : file.path}><span>{file.origPath ? `${file.origPath} → ${file.path}` : file.path}</span></span>
           <span className="glp-file-actions">
-            {canStage ? <IconButton icon="plus" label={t("Stage")} onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: [file.path] })) }} /> : null}
+            {canStage ? <IconButton icon="plus" label={file.conflicted ? t("Mark resolved") : t("Stage")} onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: [file.path] })) }} /> : null}
             {canUnstage ? <IconButton icon="undo" label={t("Unstage")} onClick={(event) => { event.stopPropagation(); void act("unstage", () => rpc("unstage", { cwd: props.cwd, paths: [file.path] })) }} /> : null}
-            <IconButton
-              icon="close"
-              label={t("Discard")}
-              onClick={(event) => {
-                event.stopPropagation()
-                if (!window.confirm(t("Discard the changes in {path}? This cannot be undone.", { path: file.path }))) return
-                void act("discard", () => rpc("discard", { cwd: props.cwd, tracked: file.untracked || file.conflicted ? [] : [file.path], untracked: file.untracked ? [file.path] : [] }), t("Discarded"))
-              }}
-            />
+            {file.conflicted ? null : (
+              <IconButton
+                icon="close"
+                label={t("Discard")}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  if (!window.confirm(t("Discard the changes in {path}? This cannot be undone.", { path: file.path }))) return
+                  void act("discard", () => rpc("discard", { cwd: props.cwd, tracked: file.untracked ? [] : [file.path], untracked: file.untracked ? [file.path] : [] }), t("Discarded"))
+                }}
+              />
+            )}
           </span>
         </div>
         {expanded[key] ? <FileDiff cwd={props.cwd} path={file.path} staged={group === "staged"} untracked={file.untracked} /> : null}
       </div>
     )
+  }
+
+  const discardAll = (files: FileChange[], what: string) => {
+    if (files.length === 0) return
+    if (!window.confirm(t("Discard the changes in {count} files? This cannot be undone.", { count: files.length }))) return
+    void act("discard", () => rpc("discard", {
+      cwd: props.cwd,
+      tracked: files.filter((file) => !file.untracked).map((file) => file.path),
+      untracked: files.filter((file) => file.untracked).map((file) => file.path),
+    }), what)
   }
 
   return (
@@ -481,7 +545,12 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
         <Empty icon="check-circle">{t("No changes")}{o.head ? <div className="glp-faint" style={{ fontSize: 11 }}>{t("The working tree is clean.")}</div> : null}</Empty>
       ) : (
         <>
-          {groups.conflicts.length > 0 ? <FileGroup title={t("Conflicts")} open={!!open.conflicts} onToggle={() => setOpen((current) => ({ ...current, conflicts: !current.conflicts }))} count={groups.conflicts.length} icon="warning">{groups.conflicts.map((file) => fileRow(file, "conflicts"))}</FileGroup> : null}
+          {groups.conflicts.length > 0 ? (
+            <FileGroup title={t("Conflicts")} open={!!open.conflicts} onToggle={() => setOpen((current) => ({ ...current, conflicts: !current.conflicts }))} count={groups.conflicts.length} icon="warning"
+              extra={<Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: groups.conflicts.map((file) => file.path) }), t("Marked resolved")) }}>{t("Mark all resolved")}</Button>}>
+              {groups.conflicts.map((file) => fileRow(file, "conflicts"))}
+            </FileGroup>
+          ) : null}
           {groups.staged.length > 0 ? (
             <FileGroup title={t("Staged")} open={!!open.staged} onToggle={() => setOpen((current) => ({ ...current, staged: !current.staged }))} count={groups.staged.length}
               extra={<Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("unstage", () => rpc("unstage", { cwd: props.cwd, paths: groups.staged.map((file) => file.path) })) }}>{t("Unstage all")}</Button>}>
@@ -490,13 +559,23 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
           ) : null}
           {groups.changes.length + groups.partially.length > 0 ? (
             <FileGroup title={t("Changes")} open={!!open.changes} onToggle={() => setOpen((current) => ({ ...current, changes: !current.changes }))} count={groups.changes.length + groups.partially.length}
-              extra={<Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: [...groups.changes, ...groups.partially].map((file) => file.path) })) }}>{t("Stage all")}</Button>}>
+              extra={
+                <span className="glp-row" style={{ gap: 2 }}>
+                  <Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); discardAll([...groups.changes, ...groups.partially], t("Discarded")) }}>{t("Discard all")}</Button>
+                  <Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: [...groups.changes, ...groups.partially].map((file) => file.path) })) }}>{t("Stage all")}</Button>
+                </span>
+              }>
               {[...groups.changes, ...groups.partially].map((file) => fileRow(file, "changes"))}
             </FileGroup>
           ) : null}
           {groups.untracked.length > 0 ? (
             <FileGroup title={t("Untracked")} open={!!open.untracked} onToggle={() => setOpen((current) => ({ ...current, untracked: !current.untracked }))} count={groups.untracked.length}
-              extra={<Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: groups.untracked.map((file) => file.path) })) }}>{t("Stage all")}</Button>}>
+              extra={
+                <span className="glp-row" style={{ gap: 2 }}>
+                  <Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); discardAll(groups.untracked, t("Discarded")) }}>{t("Discard all")}</Button>
+                  <Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); void act("stage", () => rpc("stage", { cwd: props.cwd, paths: groups.untracked.map((file) => file.path) })) }}>{t("Stage all")}</Button>
+                </span>
+              }>
               {groups.untracked.map((file) => fileRow(file, "untracked"))}
             </FileGroup>
           ) : null}
@@ -518,13 +597,15 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
           }}
         />
         <div className="glp-commit-actions">
-          <Button size="sm" variant="primary" icon="check" disabled={(!staged && !any) || !!busy} busy={busy === "commit"} onClick={() => void commit(false)}>
+          <Button size="sm" variant="primary" icon="check" disabled={(!staged && !any) || !!busy || groups.conflicts.length > 0} busy={busy === "commit"} onClick={() => void commit(false)}>
             {staged ? t("Commit") : t("Commit all")}
           </Button>
-          <Button size="sm" disabled={(!staged && !any) || !!busy} onClick={() => void commit(true)}>{t("Commit & push")}</Button>
+          <Button size="sm" disabled={(!staged && !any) || !!busy || groups.conflicts.length > 0} onClick={() => void commit(true)}>{t("Commit & push")}</Button>
           <Button size="sm" variant="ghost" disabled={(!staged && !any) || !!busy} onClick={() => setAmend((value) => !value)} data-variant={amend ? "primary" : "ghost"}>{t("Amend")}</Button>
           <span className="glp-spacer" />
-          <span className="glp-faint" style={{ fontSize: 10.5 }}><span className="glp-kbd">⌘⏎</span> {t("commits")}</span>
+          {groups.conflicts.length > 0
+            ? <span className="glp-faint" style={{ fontSize: 10.5 }}>{t("Mark every conflict resolved to commit.")}</span>
+            : <span className="glp-faint" style={{ fontSize: 10.5 }}><span className="glp-kbd">⌘⏎</span> {t("commits")}</span>}
         </div>
       </div>
 
@@ -536,7 +617,10 @@ function ChangesView(props: { overview: Overview; cwd: string; onOpenItem: (kind
             <Pill tone="warn">{outgoing.data.unpushed.length}</Pill>
             <Button size="sm" variant="ghost" onClick={() => void act("push", async () => { await rpc("push", { cwd: props.cwd, force: false }) }, t("Pushed"))}>{t("Push")}</Button>
             <Button size="sm" variant="ghost" onClick={() => { setAmend(true); toast({ tone: "info", title: t("Amend is on; write a message or leave it empty to keep the last one.") }) }}>{t("Amend")}</Button>
-            <Button size="sm" variant="ghost" onClick={() => void act("undo", async () => { await rpc("undoCommit", { cwd: props.cwd }); toast({ tone: "success", title: t("Last commit undone") }) })}>{t("Undo last commit")}</Button>
+            <Button size="sm" variant="ghost" onClick={() => {
+              if (!window.confirm(t("Undo the last commit and keep its changes unstaged?"))) return
+              void act("undo", async () => { await rpc("undoCommit", { cwd: props.cwd }); toast({ tone: "success", title: t("Last commit undone") }) })
+            }}>{t("Undo last commit")}</Button>
           </div>
           {outgoing.data.unpushed.slice(0, 8).map((commit) => (
             <div key={commit.hash} className="glp-unpushed-row">
@@ -771,7 +855,16 @@ function BranchPicker(props: {
   const query = search.trim().toLowerCase()
   const match = (branch: Branch) => !query || branch.name.toLowerCase().includes(query) || (branch.worktree ?? "").toLowerCase().includes(query)
   const local = props.branches.filter((branch) => !branch.remote && match(branch))
-  const remote = props.branches.filter((branch) => branch.remote && match(branch))
+  // Checking out a remote branch runs `switch -c <name>`, which refuses a name that is already taken. A remote whose
+  // name a local branch (or another remote's row) already carries would only offer a row that cannot succeed.
+  const taken = new Set(props.branches.filter((branch) => !branch.remote).map((branch) => branch.name))
+  const remote = props.branches.filter((branch) => {
+    if (!branch.remote || !match(branch)) return false
+    const name = branch.name.replace(/^[^/]+\//, "")
+    if (taken.has(name)) return false
+    taken.add(name)
+    return true
+  })
   const mrOf = (branch: Branch) => props.branchMrs.find((mr) => mr.head === branch.name)
   const recent = [...local].sort((a, b) => b.date - a.date).slice(0, 5)
   const withMr = local.filter((branch) => mrOf(branch))

@@ -2,12 +2,12 @@ import { QueryClientProvider } from "@tanstack/react-query"
 import { useState } from "react"
 import { createRoot } from "react-dom/client"
 import type { ItemKind } from "../shared/types"
-import { queryClient, setPluginCtx, startEvents, stopEvents, useCwd, useItem } from "./api"
+import { errorText, queryClient, setPluginCtx, startEvents, stopEvents, toast, useCwd, useItem } from "./api"
 import { ComposerPill, HeaderChip } from "./chip"
 import { RunPage } from "./ci"
 import { installMentions, setCurrentRepo } from "./mentions"
 import { t, useLanguage } from "./i18n"
-import { nav, type CommitParams, type ItemParams, type MainParams, type RunParams } from "./nav"
+import { nav, type CommitParams, type ItemParams, type MainParams, type PanelParams, type RunParams } from "./nav"
 import { forgetTab, paramsForTab, rememberTab } from "./tabs"
 import { CommitPage, MainPanel } from "./panel"
 import { ItemPage } from "./item"
@@ -17,12 +17,26 @@ import { Button, Empty, Icon, Spinner, StateIcon, Toasts } from "./ui"
 type Ctx = any
 
 export const name = "gitlab-panel"
-export const inject = ["slots", "sidebarRightTabs", "sidebarRight"]
+export const inject = ["slots", "sidebarRightTabs", "sidebarRight", "uiWorkspace"]
 
 const MAIN_ID = "dsh-gitlab-panel/main"
 const ITEM_ID = "dsh-gitlab-panel/item"
 const RUN_ID = "dsh-gitlab-panel/run"
 const COMMIT_ID = "dsh-gitlab-panel/commit"
+
+const MAIN_KIND = "gitlab"
+const ITEM_KIND = "gitlab-item"
+const RUN_KIND = "gitlab-run"
+const COMMIT_KIND = "gitlab-commit"
+
+/** What a remembered tab opened, so a second open of the same content reveals it instead of adding a tab. */
+function contentKey(params: PanelParams | undefined): string | undefined {
+  if (!params) return undefined
+  if (params.page === "item") return `item:${params.repo}:${params.kind}:${params.number}`
+  if (params.page === "run") return `run:${params.repo}:${params.id}`
+  if (params.page === "commit") return `commit:${params.repo}:${params.sha}`
+  return "main"
+}
 
 export function apply(ctx: Ctx) {
   setPluginCtx(ctx)
@@ -49,24 +63,41 @@ export function apply(ctx: Ctx) {
     }
   }, "gitlab-panel: toast host")
 
-  nav.openMain = (params: MainParams = {}) => {
-    ctx.sidebarRight.openTab("gitlab", { params })
+  /**
+   * Open one of the plugin's page types. `openTab` writes into the Session on
+   * screen and throws when there is none, which a shortcut or the composer pill
+   * can easily hit; a `multiple` type mints a fresh tab per open, so content
+   * already open is revealed here instead.
+   */
+  const openPage = (kind: string, params: PanelParams) => {
+    const sidebar = ctx.sidebarRight
+    const wanted = contentKey(params)
+    const session = sidebar.mounted?.getSnapshot?.()
+    if (wanted !== undefined && session !== undefined) {
+      for (const tab of sidebar.openTabs?.getSnapshot?.() ?? []) {
+        if (tab.kind !== kind || tab.sessionId !== session) continue
+        if (contentKey(paramsForTab(tab.tabId)) === wanted) {
+          sidebar.focus(tab.tabId)
+          return
+        }
+      }
+    }
+    sidebar.openTab(kind, { params })
+    rememberTab(sidebar.active()?.id, params)
   }
-  nav.openItem = (input) => {
-    const params: ItemParams = { page: "item", ...input }
-    ctx.sidebarRight.openTab("gitlab-item", { params })
-    rememberTab(ctx.sidebarRight.active()?.id, params)
+
+  const open = (what: string, run: () => void) => {
+    try {
+      run()
+    } catch (error) {
+      toast({ tone: "error", title: t("Could not open the GitLab panel"), description: `${what}: ${errorText(error)}` })
+    }
   }
-  nav.openRun = (input) => {
-    const params: RunParams = { page: "run", ...input }
-    ctx.sidebarRight.openTab("gitlab-run", { params })
-    rememberTab(ctx.sidebarRight.active()?.id, params)
-  }
-  nav.openCommit = (input) => {
-    const params: CommitParams = { page: "commit", ...input }
-    ctx.sidebarRight.openTab("gitlab-commit", { params })
-    rememberTab(ctx.sidebarRight.active()?.id, params)
-  }
+
+  nav.openMain = (params: MainParams = {}) => open("main", () => openPage(MAIN_KIND, { page: "main", ...params }))
+  nav.openItem = (input) => open("item", () => openPage(ITEM_KIND, { page: "item", ...input }))
+  nav.openRun = (input) => open("pipeline", () => openPage(RUN_KIND, { page: "run", ...input }))
+  nav.openCommit = (input) => open("commit", () => openPage(COMMIT_KIND, { page: "commit", ...input }))
   nav.openActivity = () => nav.openMain({ show: "activity" })
   nav.openInbox = () => nav.openMain({ show: "inbox" })
   nav.openRuns = () => nav.openMain({ show: "runs" })
@@ -76,14 +107,14 @@ export function apply(ctx: Ctx) {
       const stops = [
         ctx.sidebarRightTabs.register({
           id: MAIN_ID,
-          kind: "gitlab",
+          kind: MAIN_KIND,
           keepMounted: true,
           title: () => t("GitLab"),
           guide: [{ id: "open", order: 45, title: () => t("GitLab"), description: () => t("Git, merge requests, issues and pipelines") }],
         }),
-        ctx.sidebarRightTabs.register({ id: ITEM_ID, kind: "gitlab-item", multiple: true, keepMounted: true, title: () => t("GitLab") }),
-        ctx.sidebarRightTabs.register({ id: RUN_ID, kind: "gitlab-run", multiple: true, title: () => t("Pipelines") }),
-        ctx.sidebarRightTabs.register({ id: COMMIT_ID, kind: "gitlab-commit", multiple: true, title: () => t("History") }),
+        ctx.sidebarRightTabs.register({ id: ITEM_ID, kind: ITEM_KIND, multiple: true, keepMounted: true, title: () => t("GitLab") }),
+        ctx.sidebarRightTabs.register({ id: RUN_ID, kind: RUN_KIND, multiple: true, title: () => t("Pipelines") }),
+        ctx.sidebarRightTabs.register({ id: COMMIT_ID, kind: COMMIT_KIND, multiple: true, title: () => t("History") }),
       ]
       return () => stops.forEach((stop) => stop())
     }, "gitlab-panel: tab types"),
@@ -116,13 +147,15 @@ export function apply(ctx: Ctx) {
   safe(ctx, "shortcut", () => {
     const shortcuts = ctx.get?.("shortcuts")
     if (!shortcuts?.register) return
-    if (typeof shortcuts.platform !== "string" || !shortcuts.platform.startsWith("desktop")) return
     ctx.effect(
       () =>
         shortcuts.register({
           id: "gitlab-panel.open",
           label: () => t("Open GitLab panel"),
           aliases: ["gitlab", "git"],
+          // Only desktop defaults: the registry skips a runtime or platform a
+          // command declares none for, and a Web binding would have to clear its
+          // own browser-reservation rules.
           defaults: {
             "desktop:windows": { code: "KeyG", modifiers: ["primary", "shift"] },
             "desktop:macos": { code: "KeyG", modifiers: ["primary", "shift"] },
@@ -298,7 +331,7 @@ function SettingsCard(_props: any) {
       {open ? (
         <div style={{ fontSize: 11.5, color: "var(--dsw-alias-label-secondary, #60646c)", display: "flex", flexDirection: "column", gap: 4 }}>
           <div>{t("The host needs git. For GitLab data, set GITLAB_TOKEN to a personal access token with api scope, or run glab auth login on the host.")}</div>
-          <div>{t("Open it from the right sidebar’s + guide, the session header chip, ⌘⌥G, or /gitlab.")}</div>
+          <div>{t("Open it from the right sidebar’s + guide, the session header chip, ⌘⇧G, or /gitlab.")}</div>
           <div><Button size="sm" onClick={() => nav.openMain()}>{t("Open GitLab panel")}</Button></div>
         </div>
       ) : null}

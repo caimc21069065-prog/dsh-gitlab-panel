@@ -472,6 +472,7 @@ export function Spinner() {
 export function TextArea(props: {
   value: string
   onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => void
+  onKeyDown?: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void
   rows?: number
   placeholder?: string
   autoFocus?: boolean
@@ -487,6 +488,7 @@ export function TextArea(props: {
       autoFocus={props.autoFocus}
       data-mono={props.mono ? "" : undefined}
       onChange={props.onChange}
+      onKeyDown={props.onKeyDown}
     />
   )
 }

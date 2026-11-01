@@ -127,10 +127,12 @@ export function apply(ctx: Ctx, config: Config = {}) {
     createMr: async ({ cwd, title, body, base, draft }) => {
       const remote = await withRemote(cwd)
       if (!remote) throw new Error("No GitLab remote found for this repository.")
-      const source = await git.ensurePushed(cwd)
-      const url = await gitlab.createMergeRequest({ repo: remote.path, source, title, body, base, draft, removeSource: false })
-      broadcast({ type: "changed", cwd, remote: true })
-      return url
+      // Pushing writes to this checkout, so it takes the same per-repository queue as every other git mutation;
+      // `mutate` also broadcasts the change the old manual emit did.
+      return git.mutate(cwd, async () => {
+        const source = await git.ensurePushed(cwd)
+        return gitlab.createMergeRequest({ repo: remote.path, source, title, body, base, draft, removeSource: false })
+      }, true)
     },
     checkoutMr: async ({ cwd, repo, number }) => {
       const item = await gitlab.item({ repo, number, kind: "mr" })
@@ -159,11 +161,11 @@ export function apply(ctx: Ctx, config: Config = {}) {
     "log", "show", "branches", "mergedBranches", "outgoing", "diff", "mrDefaults", "stage", "unstage", "discard",
     "commit", "checkout", "createBranch", "deleteBranch", "deleteBranches", "undoCommit", "deleteRemoteBranch", "merge",
     "rebase", "cherryPick", "revert", "abort", "continue", "fetch", "pull", "push", "pushBranch", "stash", "stashPop",
-    "worktreeAdd",
+    "worktreeAdd", "worktreeRemove",
   ] as const
   for (const method of gitMethods) api[method] = (params) => (git as any)[method](params)
   const gitlabMethods = [
-    "search", "mrChecks", "item", "comment", "setState", "edit", "setDraft", "repoMeta", "remoteCommit", "files",
+    "search", "item", "comment", "setState", "edit", "setDraft", "repoMeta", "remoteCommit", "files",
     "reviews", "submitReview", "replyThread", "resolveThread", "lineComment", "createReview", "runs", "run", "jobLog",
     "rerun", "cancelRun", "retryJob", "cancelJob", "markRead",
   ] as const

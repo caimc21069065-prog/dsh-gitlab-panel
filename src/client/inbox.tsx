@@ -6,7 +6,7 @@ import { t } from "./i18n"
 import { nav } from "./nav"
 import { Age, Button, Empty, Icon, IconButton, Pill, Spinner, StateIcon } from "./ui"
 
-export function InboxView(props: { repo: string; cwd: string; sessionId: string; onOpenItem: (kind: ItemKind, number: number) => void }) {
+export function InboxView(props: { repo: string; cwd: string; sessionId: string; onOpenItem: (kind: ItemKind, number: number, repo?: string) => void }) {
   const inbox = useInbox(true, 60_000)
   const [busy, setBusy] = useState(false)
   const data = inbox.data
@@ -21,7 +21,8 @@ export function InboxView(props: { repo: string; cwd: string; sessionId: string;
   }, [data])
 
   const open = async (entry: InboxEntry) => {
-    if (entry.number) props.onOpenItem(entry.kind === "mr" ? "mr" : "issue", entry.number)
+    // A todo carries its own project; numbering is per project, so opening it in the current one would show a different item.
+    if (entry.number) props.onOpenItem(entry.kind === "mr" ? "mr" : "issue", entry.number, entry.repo || undefined)
     if (entry.thread) {
       try {
         await rpc("markRead", { thread: entry.thread })

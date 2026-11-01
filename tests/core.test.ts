@@ -110,6 +110,26 @@ test("parsePatch numbers lines and finds hunks", () => {
   assert.match(hunkAt(patch, 10, "RIGHT"), /context/)
 })
 
+test("parsePatch ignores the raw git diff preamble", () => {
+  const raw = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "index 1234567..89abcde 100644",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1,2 +1,2 @@",
+    " keep",
+    "-old",
+    "+new",
+    "",
+  ].join("\n")
+  const lines = parsePatch(raw)
+  assert.deepEqual(lines.map((line) => line.kind), ["hunk", "hunk", "context", "del", "add"])
+  assert.equal(lines[0]?.text, "diff --git a/src/app.ts b/src/app.ts")
+  assert.equal(lines[1]?.text, "@@ -1,2 +1,2 @@")
+  // The file headers must not be counted as one deletion and one addition.
+  assert.deepEqual(diffStats(raw), { additions: 1, deletions: 1 })
+})
+
 test("refs understand #issues and !merge requests", () => {
   const refs = findRefs("Fix #12 and group/sub/project!34, not a#1 or &#1;")
   assert.deepEqual(refs.map((ref) => [ref.repo, ref.kind, ref.number]), [
@@ -119,10 +139,12 @@ test("refs understand #issues and !merge requests", () => {
 })
 
 test("GitLab links resolve issues, MRs, commits and pipelines", () => {
-  assert.deepEqual(parseGitLabLink("https://gitlab.com/group/app/-/merge_requests/9/diffs"), { kind: "item", repo: "group/app", number: 9, files: true })
-  assert.deepEqual(parseGitLabLink("https://gitlab.example.com/g/p/-/issues/4"), { kind: "item", repo: "g/p", number: 4, files: false })
+  assert.deepEqual(parseGitLabLink("https://gitlab.com/group/app/-/merge_requests/9/diffs"), { kind: "item", repo: "group/app", number: 9, item: "mr", files: true })
+  assert.deepEqual(parseGitLabLink("https://gitlab.example.com/g/p/-/issues/4"), { kind: "item", repo: "g/p", number: 4, item: "issue", files: false })
   assert.deepEqual(parseGitLabLink("https://gitlab.com/g/p/-/commit/abcdef123456"), { kind: "commit", repo: "g/p", sha: "abcdef123456" })
   assert.deepEqual(parseGitLabLink("https://gitlab.com/g/p/-/pipelines/77/jobs/88"), { kind: "run", repo: "g/p", id: 77, job: 88 })
+  // Issues and merge requests number independently, so a legacy URL keeps which one it named.
+  assert.deepEqual(parseGitLabLink("https://gitlab.com/g/p/merge_requests/4"), { kind: "item", repo: "g/p", number: 4, item: "mr", files: false })
 })
 
 test("branch names and closing keywords follow GitLab conventions", () => {
@@ -143,14 +165,32 @@ test("search queries map GitHub-style qualifiers to GitLab parameters", () => {
   const parsed = parseSearchQuery("is:open label:bug author:@me reviewer:@me sort:updated-desc crash", "mr")
   assert.equal(parsed.params.state, "opened")
   assert.equal(parsed.params.labels, "bug")
-  assert.equal(parsed.params.author_username, "me")
-  assert.equal(parsed.params.reviewer_username, "me")
+  // `@me` stays a sentinel: GitLab's *_username params take a literal name, so the host resolves it.
+  assert.equal(parsed.params.author_username, "@me")
+  assert.equal(parsed.params.reviewer_username, "@me")
   assert.equal(parsed.params.order_by, "updated")
   assert.equal(parsed.params.sort, "desc")
   assert.equal(parsed.search, "crash")
   const closed = parseSearchQuery("is:closed no:assignee", "issue")
   assert.equal(closed.params.state, "closed")
   assert.equal(closed.params.assignee_id, "None")
+})
+
+test("negated and draft qualifiers do not invert into their opposite", () => {
+  const negated = parseSearchQuery("-label:bug -milestone:v1 -author:@me", "issue")
+  assert.equal(negated.params["not[labels]"], "bug")
+  assert.equal(negated.params["not[milestone]"], "v1")
+  assert.equal(negated.params.labels, undefined)
+  assert.equal(negated.params.author_username, undefined)
+  assert.equal(negated.search, "")
+  assert.equal(parseSearchQuery("draft:false", "mr").params.wip, "no")
+  assert.equal(parseSearchQuery("is:draft", "mr").params.wip, "yes")
+  assert.equal(parseSearchQuery("-is:draft", "mr").params.wip, "no")
+  assert.equal(parseSearchQuery("is:ready", "mr").params.wip, "no")
+  assert.equal(parseSearchQuery("no:milestone", "issue").params.milestone, "None")
+  // The other kind's name is dropped, never searched for literally.
+  assert.equal(parseSearchQuery("is:pr", "mr").search, "")
+  assert.equal(parseSearchQuery("is:issue", "mr").search, "")
 })
 
 test("graph layout keeps a first-parent lane straight through a merge", () => {

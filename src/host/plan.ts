@@ -95,7 +95,11 @@ function checkNames(names: unknown, field: string, kind: WriteKind) {
   const checked = names.map((name) => {
     if (typeof name !== "string" || !name.trim()) throw new Error(`\`${field}\` has an empty name.`)
     if (kind === "label") return name.trim()
-    return name.trim() === "@me" ? "@me" : name.trim().replace(/^@/, "")
+    const login = name.trim() === "@me" ? "@me" : name.trim().replace(/^@/, "")
+    // GitLab usernames start alphanumeric or with an underscore, may then contain a dash or a dot, and do not end with
+    // one. Anything else is a typo worth reporting now rather than an assignment that quietly changes nobody.
+    if (login !== "@me" && !/^[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?$/.test(login)) throw new Error(`"${name}" is not a GitLab username.`)
+    return login
   })
   return [...new Set(checked)]
 }
@@ -182,21 +186,6 @@ export function toggleRange(selected: ReadonlySet<number>, numbers: readonly num
   return on ? new Set([...selected, ...span]) : new Set([...selected].filter((item) => !span.includes(item)))
 }
 
-export function itemList(
-  repo: string,
-  kind: "issue" | "mr",
-  items: readonly { readonly number: number; readonly title: string; readonly state: string; readonly author: string; readonly labels: readonly { readonly name: string }[] }[],
-) {
-  return [
-    `${items.length} ${kind === "mr" ? "merge requests" : "issues"} in ${repo}:`,
-    "",
-    ...items.map(
-      (item) =>
-        `- ${kind === "mr" ? "!" : "#"}${item.number} (${item.state.toLowerCase()}) ${item.title}${item.labels.length > 0 ? ` [${item.labels.map((label) => label.name).join(", ")}]` : ""} · @${item.author}`,
-    ),
-  ].join("\n")
-}
-
 export function triagePrompt(input: {
   readonly repo: string
   readonly kind: "issue" | "mr"
@@ -272,12 +261,12 @@ export function describe(action: Pick<AgentAction, "kind" | "payload" | "item">)
   const noun = action.kind === "label" ? "label" : "assignee"
   const mark = action.kind === "label" ? "" : "@"
   const list = (names: readonly string[] | undefined) => (names ?? []).map((name) => (name === "@me" ? name : `${mark}${name}`)).join(", ")
-  return [
+  const parts = [
     payload.add?.length ? `add ${noun}${payload.add.length > 1 ? "s" : ""} ${list(payload.add)}` : "",
     payload.remove?.length ? `remove ${noun}${payload.remove.length > 1 ? "s" : ""} ${list(payload.remove)}` : "",
-  ]
-    .filter(Boolean)
-    .join(", ")
+  ].filter(Boolean)
+  // A shell `--unassign` names nobody, so fall back to the command line rather than describing nothing.
+  return parts.length > 0 ? parts.join(", ") : `ran \`${oneLine(payload.command ?? "", 80)}\``
 }
 
 export function undoFor(action: AgentAction): { kind: AgentKind; payload: AgentPayload } | undefined {
@@ -335,7 +324,7 @@ const VALUE_FLAGS: Record<string, readonly string[]> = {
   comment: ["-m", "--message", "-F", "--file"],
   update: [
     "-t", "--title", "-d", "--description", "-m", "--milestone", "-a", "--assignee", "--add-label", "--remove-label",
-    "--reviewer", "--unassign", "--target-branch", "--source-branch",
+    "--reviewer", "--target-branch", "--source-branch",
   ],
   merge: ["-m", "--message", "-b", "--branch", "--sha"],
   approve: [],
@@ -359,6 +348,8 @@ export function parseShell(command: string): ShellGlab[] {
     if (env === -1) return []
     const glab = tokens[env] ?? ""
     if (glab !== "glab" && !glab.endsWith("/glab")) return []
+    // `GITLAB_REPO=g/p glab …` names the project the same way `-R` does, and outranks this checkout.
+    const envRepo = tokens.slice(0, env).map((token) => /^GITLAB_REPO=(.+)$/.exec(token)?.[1]).filter(Boolean).at(-1)
     const args = tokens.slice(env + 1)
     const flags = new Map<string, string[]>()
     const positional: string[] = []
@@ -388,7 +379,7 @@ export function parseShell(command: string): ShellGlab[] {
     const target = targetOf(positional[0] ?? "")
     if (!target) return []
     const flagRepo = flags.get("-R")?.at(-1) ?? flags.get("--repo")?.at(-1)
-    const repo = target.repo ?? repoName(flagRepo)
+    const repo = target.repo ?? repoName(flagRepo) ?? repoName(envRepo)
     const group = verbAt.group === "mr" ? "mr" : "issue"
     const line = tokens.map((token) => (/^[\w@%+=:,./#!-]+$/.test(token) ? token : JSON.stringify(token))).join(" ")
     return [{ group, verb: verbAt.verb, number: target.number, repo, cd: where.cd, ...shellKind(verbAt.verb, flags, line) }]
@@ -408,11 +399,13 @@ function shellKind(verb: string, flags: ReadonlyMap<string, string[]>, command: 
   if (verb === "unapprove") return { kind: "unapprove", payload: line }
   if (verb !== "update") return { kind: "other", payload: line }
   const labels = { add: values("--add-label", "-l", "--label"), remove: values("--remove-label") }
+  // `--unassign` is a boolean flag in glab: it clears every assignee and names none of them.
+  const unassigned = (flags.get("--unassign") ?? []).length > 0
   const people = { add: values("-a", "--assignee"), remove: values("--unassign") }
   const reviewers = { add: values("--reviewer") }
   const other = [...flags.keys()].some((flag) => !["-R", "--repo", "--add-label", "--remove-label", "-l", "--label", "-a", "--assignee", "--unassign", "--reviewer"].includes(flag))
-  if (!other && labels.add.length + labels.remove.length > 0 && people.add.length + people.remove.length === 0) return { kind: "label", payload: { ...line, ...labels } }
-  if (!other && people.add.length + people.remove.length > 0 && labels.add.length + labels.remove.length === 0) return { kind: "assign", payload: { ...line, ...people } }
+  if (!other && labels.add.length + labels.remove.length > 0 && people.add.length + people.remove.length === 0 && !unassigned) return { kind: "label", payload: { ...line, ...labels } }
+  if (!other && (people.add.length + people.remove.length > 0 || unassigned) && labels.add.length + labels.remove.length === 0) return { kind: "assign", payload: { ...line, ...people } }
   if (!other && reviewers.add.length > 0) return { kind: "assign", payload: { ...line, add: reviewers.add } }
   return { kind: "other", payload: line }
 }

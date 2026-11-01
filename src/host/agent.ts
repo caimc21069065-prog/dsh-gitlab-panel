@@ -169,11 +169,10 @@ export function createAgent(deps: AgentDeps) {
     const current = claimed.actions.find((item) => item.id === action.id)
     if (!taken.value || !current) return
     const outcome = await attempt(current, 0)
-    const kind = current.item === "issue" ? "issue" : "mr"
     const finished = await patch(current, "error" in outcome ? { status: "failed", error: outcome.error } : { status: "done", error: null, result: outcome.result })
     const original = current.undoOf ? finished.actions.find((item) => item.id === current.undoOf) : undefined
     if (original) await patch(original, "error" in outcome ? { undoneBy: null } : { status: "undone" })
-    deps.emit({ type: "item", repo: action.repo, number: action.number, ...(current.kind === "close" ? { state: kind === "issue" ? "CLOSED" : "CLOSED" } : current.kind === "reopen" ? { state: "OPEN" } : {}) })
+    deps.emit({ type: "item", repo: action.repo, number: action.number, ...(current.kind === "close" ? { state: "CLOSED" } : current.kind === "reopen" ? { state: "OPEN" } : {}) })
   }
 
   const attempt = async (action: AgentAction, tries: number, progress: Progress = {}): Promise<{ result: AgentResult } | { error: string }> => {
@@ -338,7 +337,7 @@ export function createAgent(deps: AgentDeps) {
       },
     )
     await add(context.sessionID, actions)
-    const notProposed = reasons.length > 0 ? ["", "Not proposed:", ...reasons.map(([number, reason]) => `- ${proposal.kind === "comment" ? "#" : "#"}${number}: ${reason}`)] : []
+    const notProposed = reasons.length > 0 ? ["", "Not proposed:", ...reasons.map(([number, reason]) => `- ${info.get(number)?.item === "mr" ? "!" : "#"}${number}: ${reason}`)] : []
     if (actions.length === 0) return [`Nothing was proposed on ${repo}.`, ...notProposed].join("\n")
     if (!queue.auto) {
       return [
@@ -382,7 +381,7 @@ export function createAgent(deps: AgentDeps) {
     const queue = await load(sessionID)
     const older = item.comments.length - keep
     const context = itemContextText(item, keep)
-    const mine = queue.actions.filter((action) => action.repo === repo && action.number === number)
+    const mine = queue.actions.filter((action) => action.repo === repo && action.number === number && action.item === item.kind)
     return [
       context,
       ...(older > 0 ? ["", `_${older} older comments not shown; pass a larger \`comments\` to read them._`] : []),
@@ -988,12 +987,12 @@ export function createAgent(deps: AgentDeps) {
         deps.log("warn", "could not record a glab command", { error: message(error) }),
       )
     }
-    ctx.on("tools/result", hook)
+    const unhook = ctx.on("tools/result", hook)
     return () => {
       worker.stopped = true
       worker.wake?.()
       waits.forEach((abort) => abort())
-      ctx.off?.("tools/result", hook)
+      unhook()
     }
   }
 

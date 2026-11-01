@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { hunkAt, parsePatch } from "../shared/core"
-import type { AgentAction, ChangedFile, DraftComment, DraftReview, Item, ItemKind, ReviewEvent, Thread } from "../shared/types"
+import { hunkAt, mergeability, parsePatch } from "../shared/core"
+import type { AgentAction, ChangedFile, CloseReason, DraftComment, DraftReview, Item, ItemKind, ReviewEvent, Thread } from "../shared/types"
 import {
   api,
   errorText,
@@ -43,6 +43,7 @@ import {
   Empty,
   Icon,
   IconButton,
+  InlineError,
   LabelChip,
   Markdown,
   Menu,
@@ -67,6 +68,8 @@ export function ItemPage(props: { repo: string; kind: ItemKind; number: number; 
   const prefs = usePrefs()[0]
   const overview = useOverview(props.cwd, { enabled: !!props.cwd })
   const drafts = useDrafts(props.repo, props.number, props.sessionId)
+  // Only an open merge request takes a verdict, and GitLab refuses one from its own author.
+  const reviews = useReviews(props.repo, props.number, item.data?.kind === "mr" && item.data?.state === "OPEN")
   const data = item.data
   useEffect(() => {
     setCurrentRepo(props.repo)
@@ -101,6 +104,28 @@ export function ItemPage(props: { repo: string; kind: ItemKind; number: number; 
     })
   }
 
+  const sendReview = (event: ReviewEvent) => {
+    const typed = comment
+    // GitLab records a bare approval; the other two verdicts post a note, so they need something to say.
+    if (!typed.trim() && event !== "APPROVE") return
+    void act(
+      "comment",
+      async () => {
+        await rpc("submitReview", { repo: props.repo, number: props.number, event, body: typed })
+        // Clear only what was sent, so anything typed while it was in flight survives.
+        setComment((current) => (current === typed ? "" : current))
+      },
+      event === "APPROVE" ? t("Approved") : event === "REQUEST_CHANGES" ? t("Changes requested") : t("Review submitted"),
+    )
+  }
+
+  const composerKey = (event: { key: string; metaKey: boolean; ctrlKey: boolean; preventDefault: () => void }) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault()
+      void postComment()
+    }
+  }
+
   const reopen = () => void act("reopen", async () => { await rpc("setState", { repo: props.repo, number: props.number, kind: data?.kind ?? props.kind, open: true }) }, t("Reopened"))
 
   const quote = async () => {
@@ -132,9 +157,10 @@ export function ItemPage(props: { repo: string; kind: ItemKind; number: number; 
   }
 
   const state = data.draft && data.state === "OPEN" ? "DRAFT" : data.state
-  const pending = (agent.data?.actions ?? []).filter((action) => action.repo === props.repo && action.number === props.number && (action.status === "proposed" || action.status === "approved" || action.status === "running"))
+  const pending = (agent.data?.actions ?? []).filter((action) => action.repo === props.repo && action.number === props.number && action.item === data.kind && (action.status === "proposed" || action.status === "approved" || action.status === "running"))
   const currentDraft = drafts.data?.find((draft) => draft.sessionID === props.sessionId) ?? undefined
   const otherDraft = drafts.data?.find((draft) => draft.sessionID !== props.sessionId)
+  const mine = reviews.data?.mine ?? false
 
   const menu: MenuEntry[] = [
     { label: t("Edit"), icon: "settings", onSelect: () => setDialog("edit") },
@@ -210,7 +236,7 @@ export function ItemPage(props: { repo: string; kind: ItemKind; number: number; 
               {data.assignees.map((name) => <span key={name} className="glp-chip"><Avatar name={name} size={12} /> {name}</span>)}
               {data.milestone ? <Pill>{t("Milestone")}: {data.milestone}</Pill> : null}
               {data.pr?.review ? <Pill tone={data.pr.review === "APPROVED" ? "success" : "accent"}>{data.pr.review === "APPROVED" ? t("Approved") : t("Review required")}</Pill> : null}
-              {data.pr?.mergeable ? <Pill tone={data.pr.mergeable === "can_be_merged" ? "success" : data.pr.mergeable === "cannot_be_merged" ? "danger" : undefined}>{t(data.pr.mergeable.replace(/_/g, " "))}</Pill> : null}
+              {data.pr?.mergeable ? <Pill tone={mergeability(data.pr.mergeable).tone}>{t(mergeability(data.pr.mergeable).label)}</Pill> : null}
             </div>
 
             {pending.length > 0 ? <AgentBanner actions={pending} onEdit={setEditingProposal} onDone={refresh} /> : null}
@@ -259,12 +285,28 @@ export function ItemPage(props: { repo: string; kind: ItemKind; number: number; 
             </div>
 
             <div className="glp-col" style={{ gap: 5, borderTop: "0.5px solid var(--glp-border)", paddingTop: 10 }}>
-              <TextArea rows={4} value={comment} onChange={(event) => setComment(event.target.value)} placeholder={t("Comment…")} />
+              <TextArea rows={4} value={comment} onChange={(event) => setComment(event.target.value)} onKeyDown={composerKey} placeholder={t("Comment…")} />
               <div className="glp-row">
                 <span className="glp-faint" style={{ fontSize: 10.5 }}>{t("Markdown is supported. ⌘⏎ posts.")}</span>
                 <span className="glp-spacer" />
+                {data.kind === "mr" && data.state === "OPEN" ? (
+                  <Menu
+                    trigger="text"
+                    icon="eye"
+                    align="end"
+                    label={t("Submit review")}
+                    disabled={!!busy}
+                    items={[
+                      { label: t("Approve"), icon: "check-circle", disabled: mine || !!busy, onSelect: () => sendReview("APPROVE") },
+                      { label: t("Request changes"), icon: "warning", disabled: mine || !!busy || !comment.trim(), onSelect: () => sendReview("REQUEST_CHANGES") },
+                      { type: "separator" },
+                      { label: t("Comment"), icon: "comment", disabled: !!busy || !comment.trim(), onSelect: () => sendReview("COMMENT") },
+                    ]}
+                  />
+                ) : null}
                 <Button size="sm" variant="primary" busy={busy === "comment"} disabled={!comment.trim()} onClick={() => void postComment()}>{t("Comment")}</Button>
               </div>
+              {mine ? <div className="glp-faint" style={{ fontSize: 10.5 }}>{t("You wrote this merge request, so GitLab will not record a verdict from you.")}</div> : null}
             </div>
           </div>
         ) : null}
@@ -344,13 +386,25 @@ export function describeAction(action: AgentAction) {
 export function EditProposalDialog(props: { action: AgentAction | undefined; onClose: () => void; onDone: () => void }) {
   const [body, setBody] = useState("")
   const [reason, setReason] = useState("completed")
+  const [duplicateOf, setDuplicateOf] = useState("")
+  const [add, setAdd] = useState("")
+  const [remove, setRemove] = useState("")
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const kind = props.action?.kind
   useEffect(() => {
-    if (props.action) {
-      setBody(props.action.payload.body ?? "")
-      setReason(props.action.payload.reason ?? "completed")
-    }
+    if (!props.action) return
+    const payload = props.action.payload
+    setBody(payload.body ?? "")
+    setReason(payload.reason ?? "completed")
+    setDuplicateOf(payload.duplicateOf ? String(payload.duplicateOf) : "")
+    setAdd((payload.add ?? []).join(", "))
+    setRemove((payload.remove ?? []).join(", "))
+    setError(undefined)
   }, [props.action])
+
+  const names = (text: string) => text.split(",").map((name) => name.trim()).filter(Boolean)
+
   return (
     <Modal
       open={!!props.action}
@@ -363,15 +417,25 @@ export function EditProposalDialog(props: { action: AgentAction | undefined; onC
             variant="primary"
             busy={busy}
             onClick={async () => {
-              if (!props.action) return
+              const action = props.action
+              if (!action || busy) return
               setBusy(true)
+              setError(undefined)
               try {
-                await rpc("agentEdit", { sessionID: props.action.sessionID, id: props.action.id, body: body || undefined, reason: props.action.kind === "close" ? reason : undefined })
+                // The edited field is always sent, empty or not: leaving it out would keep whatever was proposed
+                // before, so clearing the comment box would silently leave the old comment on the action.
+                const edit =
+                  action.kind === "label" || action.kind === "assign"
+                    ? { add: names(add), remove: names(remove) }
+                    : action.kind === "close"
+                      ? { body, reason: reason as CloseReason, duplicateOf: reason === "duplicate" ? Number(duplicateOf.replace("#", "")) || null : null }
+                      : { body }
+                await rpc("agentEdit", { sessionID: action.sessionID, id: action.id, ...edit })
                 toast({ tone: "success", title: t("Saved") })
                 props.onClose()
                 props.onDone()
-              } catch (error) {
-                errorToast(error)
+              } catch (caught) {
+                setError(errorText(caught))
               } finally {
                 setBusy(false)
               }
@@ -382,7 +446,9 @@ export function EditProposalDialog(props: { action: AgentAction | undefined; onC
         </>
       }
     >
-      {props.action?.kind === "close" && props.action.item === "issue" ? (
+      {props.action ? <div className="glp-dim">{props.action.repo}{props.action.item === "mr" ? "!" : "#"}{props.action.number} · {props.action.title}</div> : null}
+      {error ? <InlineError error={error} /> : null}
+      {kind === "close" && props.action?.item === "issue" ? (
         <label className="glp-col" style={{ gap: 4 }}>
           <span className="glp-dim">{t("Reason")}</span>
           <select className="glp-select" value={reason} onChange={(event) => setReason(event.target.value)}>
@@ -392,11 +458,29 @@ export function EditProposalDialog(props: { action: AgentAction | undefined; onC
           </select>
         </label>
       ) : null}
-      {["comment", "close", "reopen"].includes(props.action?.kind ?? "") ? (
+      {kind === "close" && reason === "duplicate" && props.action?.item === "issue" ? (
+        <label className="glp-col" style={{ gap: 4 }}>
+          <span className="glp-dim">{t("Duplicate of")}</span>
+          <input className="glp-input" value={duplicateOf} onChange={(event) => setDuplicateOf(event.target.value)} placeholder="#" />
+        </label>
+      ) : null}
+      {kind === "comment" || kind === "close" || kind === "reopen" ? (
         <label className="glp-col" style={{ gap: 4 }}>
           <span className="glp-dim">{t("Comment")}</span>
           <TextArea rows={6} value={body} onChange={(event) => setBody(event.target.value)} />
         </label>
+      ) : null}
+      {kind === "label" || kind === "assign" ? (
+        <>
+          <label className="glp-col" style={{ gap: 4 }}>
+            <span className="glp-dim">{kind === "label" ? t("Add labels") : t("Add assignees")}</span>
+            <input className="glp-input" value={add} onChange={(event) => setAdd(event.target.value)} placeholder={t("Comma-separated")} />
+          </label>
+          <label className="glp-col" style={{ gap: 4 }}>
+            <span className="glp-dim">{kind === "label" ? t("Remove labels") : t("Remove assignees")}</span>
+            <input className="glp-input" value={remove} onChange={(event) => setRemove(event.target.value)} placeholder={t("Comma-separated")} />
+          </label>
+        </>
       ) : null}
     </Modal>
   )

@@ -26,6 +26,8 @@ export type Operation = "merge" | "rebase" | "am" | "cherry-pick" | "revert" | n
 
 export interface Overview {
   root: string
+  /** The repository's main checkout; different from `root` when this session works in a linked worktree. */
+  worktreeRoot: string
   name: string
   branch: string | null
   head: string | null

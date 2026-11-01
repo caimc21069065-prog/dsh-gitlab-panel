@@ -1,4 +1,4 @@
-import type { Branch, CheckState, CloseReason, Commit, FileChange, Ref, Remote } from "./types"
+import type { Branch, CheckState, CloseReason, Commit, FileChange, ItemKind, Ref, Remote } from "./types"
 
 export const FIELD = "\x1f"
 export const RECORD = "\x1e"
@@ -210,7 +210,7 @@ export function findRefs(text: string) {
 
 /** A GitLab URL that names an issue, merge request, pipeline, job or commit this panel can show itself. */
 export type GitLabLink =
-  | { kind: "item"; repo: string; number: number; files: boolean }
+  | { kind: "item"; repo: string; number: number; item: ItemKind; files: boolean }
   | { kind: "commit"; repo: string; sha: string }
   | { kind: "run"; repo: string; id: number; job: number | null }
 
@@ -232,8 +232,9 @@ export function parseGitLabLink(href: string): GitLabLink | undefined {
     rest = `${legacy[2]}/${legacy[3]}`
   }
   if (!repo) return undefined
-  const item = /^(?:issues|merge_requests)\/(\d+)(\/diffs)?/.exec(rest)
-  if (item?.[1]) return { kind: "item", repo, number: Number(item[1]), files: !!item[2] }
+  // Issues and merge requests number independently, so the URL segment is the only thing that says which one this is.
+  const item = /^(issues|merge_requests)\/(\d+)(\/diffs)?/.exec(rest)
+  if (item?.[2]) return { kind: "item", repo, number: Number(item[2]), item: item[1] === "merge_requests" ? "mr" : "issue", files: !!item[3] }
   const commit = /^(?:commit|merge_requests\/\d+\/commits)\/([0-9a-f]{7,40})/.exec(rest)
   if (commit?.[1]) return { kind: "commit", repo, sha: commit[1] }
   const run = /^pipelines\/(\d+)(?:\/(?:jobs|builds)\/(\d+))?/.exec(rest)
@@ -290,26 +291,35 @@ export interface DiffLine {
 export function parsePatch(patch: string): DiffLine[] {
   const lines: DiffLine[] = []
   const at = { old: 0, new: 0 }
-  patch.split("\n").forEach((text) => {
+  // Raw `git diff` output carries a preamble (`diff --git`, `index`, `--- a/f`, `+++ b/f`) that is not diff
+  // content. Only lines after a hunk header are classified, so a file header never renders as a change.
+  let inHunk = false
+  for (const text of patch.split("\n")) {
     const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text)
     if (hunk) {
       at.old = Number(hunk[1])
       at.new = Number(hunk[2])
+      inHunk = true
       lines.push({ kind: "hunk", text, old: null, new: null })
-      return
+      continue
     }
-    if (text.startsWith("\\") || text === "") return
+    if (text.startsWith("diff --git ") || text.startsWith("Binary files ")) {
+      inHunk = false
+      lines.push({ kind: "hunk", text, old: null, new: null })
+      continue
+    }
+    if (!inHunk) continue
+    if (text.startsWith("\\") || text === "") continue
     if (text.startsWith("+")) {
       lines.push({ kind: "add", text: text.slice(1), old: null, new: at.new++ })
-      return
+      continue
     }
     if (text.startsWith("-")) {
       lines.push({ kind: "del", text: text.slice(1), old: at.old++, new: null })
-      return
+      continue
     }
-    if (lines.length === 0) return
     lines.push({ kind: "context", text: text.slice(1), old: at.old++, new: at.new++ })
-  })
+  }
   return lines
 }
 
@@ -372,9 +382,40 @@ export function checkState(status: string | null | undefined): CheckState {
   return "none"
 }
 
+/**
+ * GitLab reports mergeability through two different fields: the coarse `merge_status`
+ * (`can_be_merged` / `cannot_be_merged` / `checking`) and the finer `detailed_merge_status`
+ * (`mergeable`, `ci_must_pass`, `not_approved`, …). Either can arrive, so both map to one label.
+ */
+export function mergeability(status: string | null | undefined): { tone: "success" | "danger" | "warn" | undefined; label: string } {
+  switch (status) {
+    case "can_be_merged":
+    case "mergeable":
+      return { tone: "success", label: "Ready to merge" }
+    case "cannot_be_merged":
+      return { tone: "danger", label: "Merge conflicts" }
+    case "ci_must_pass":
+    case "ci_still_running":
+      return { tone: "warn", label: "Waiting on the pipeline" }
+    case "discussions_not_resolved":
+      return { tone: "warn", label: "Discussions to resolve" }
+    case "draft_status":
+      return { tone: "warn", label: "Still a draft" }
+    case "not_approved":
+      return { tone: "warn", label: "Needs approval" }
+    case "blocked_status":
+    case "external_status_check":
+      return { tone: "warn", label: "Blocked" }
+    case "checking":
+    case "unchecked":
+      return { tone: undefined, label: "Checking mergeability" }
+    default:
+      return { tone: undefined, label: status ? status.replace(/_/g, " ") : "" }
+  }
+}
+
 /** A GitHub-style query translated into GitLab list parameters. Unknown qualifiers remain free-text search. */
-export interface ParsedQuery {
-  search: string
+export interface ParsedQuery {  search: string
   params: Record<string, string>
   sort: string | null
 }
@@ -417,20 +458,22 @@ export function parseSearchQuery(query: string, kind: "issue" | "mr"): ParsedQue
         else state(value)
         continue
       }
-      if (value === "draft" && kind === "mr") {
-        params.wip = "yes"
+      if (kind === "mr" && (value === "draft" || value === "ready")) {
+        params.wip = (value === "ready" ? !negated : negated) ? "no" : "yes"
         continue
       }
-      if (value === "issue" && kind === "mr") continue
-      if (value === "pr" && kind === "issue") continue
+      // A kind selector says nothing about a list whose kind the caller already fixed; searching for it literally finds nothing.
+      if (value === "issue" || value === "pr" || value === "mr") continue
     }
     if (key === "sort" && order(value)) continue
     if (key === "label") {
-      params.labels = joinList(params.labels, value)
+      if (negated) params["not[labels]"] = joinList(params["not[labels]"], value)
+      else params.labels = joinList(params.labels, value)
       continue
     }
     if (key === "author") {
-      params.author_username = normUser(value)
+      // GitLab has no `not[author_username]`; dropping the qualifier beats inverting it.
+      if (!negated) params.author_username = normUser(value)
       continue
     }
     if (key === "assignee") {
@@ -439,11 +482,12 @@ export function parseSearchQuery(query: string, kind: "issue" | "mr"): ParsedQue
       continue
     }
     if (key === "reviewer" && kind === "mr") {
-      params.reviewer_username = normUser(value)
+      if (!negated) params.reviewer_username = normUser(value)
       continue
     }
     if (key === "milestone") {
-      params.milestone = value
+      if (negated) params["not[milestone]"] = value
+      else params.milestone = value
       continue
     }
     if (key === "no" && value === "assignee") {
@@ -454,8 +498,12 @@ export function parseSearchQuery(query: string, kind: "issue" | "mr"): ParsedQue
       params.labels = "None"
       continue
     }
+    if (key === "no" && value === "milestone") {
+      params.milestone = "None"
+      continue
+    }
     if (key === "draft" && kind === "mr") {
-      params.wip = "yes"
+      params.wip = /^(false|no|0)$/i.test(value) || negated ? "no" : "yes"
       continue
     }
     if (key === "in") {
@@ -509,8 +557,9 @@ function tokenize(query: string) {
   return tokens
 }
 
+/** Strips the leading `@`. `@me` stays a sentinel: GitLab's `*_username` params take a literal name, so the host resolves it. */
 function normUser(value: string) {
-  return value === "@me" ? "me" : value.replace(/^@/, "")
+  return value === "@me" ? "@me" : value.replace(/^@/, "")
 }
 
 function joinList(current: string | undefined, value: string) {

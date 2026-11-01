@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs"
 import { readdir, readFile } from "node:fs/promises"
-import { basename, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import { arg, batched, pathspec, run, type Log } from "./exec"
 import { BRANCH_FORMAT, LOG_FORMAT, FIELD, parseBranches, parseLog, parseRemote, parseStatus, parseWorktrees } from "../shared/core"
 import type { Branch, Commit, CommitDetails, MergeRequests, Operation, Overview, PrDefaults, Remote } from "../shared/types"
@@ -24,6 +24,8 @@ export interface GitFacts {
   root: string
   gitDir: string
   common: string
+  /** The main checkout of this repository, which is `root` unless the session works in a linked worktree. */
+  mainRoot: string
   remote: Remote | null
   defaultBranch: string | null
 }
@@ -122,10 +124,13 @@ export function createGit(deps: GitDeps) {
     const top = (await probe(cwd, ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"])).trim().split(/\r?\n/)
     const [root, gitDir, common] = top
     if (!root || !gitDir) return null
+    const shared = !common ? gitDir : isAbsolute(common) ? common : join(cwd, common)
     return {
       root,
       gitDir,
-      common: !common ? gitDir : isAbsolute(common) ? common : join(cwd, common),
+      common: shared,
+      // A linked worktree keeps the shared dir under the main checkout's `.git`, so its parent is that checkout.
+      mainRoot: basename(shared) === ".git" ? dirname(shared) : root,
       remote: await remote(cwd),
       defaultBranch: await defaultBranch(cwd, (await remote(cwd))?.name),
     }
@@ -183,6 +188,7 @@ export function createGit(deps: GitDeps) {
       const parsed = parseStatus(status)
       return {
         root: found.root,
+        worktreeRoot: found.mainRoot,
         name: basename(found.root),
         branch: parsed.branch.branch,
         head: parsed.branch.head,
@@ -383,9 +389,20 @@ export function createGit(deps: GitDeps) {
         let path = join(join(root, ".."), `${basename(root)}-${safe}`)
         let suffix = 2
         while (existsSync(path)) path = join(join(root, ".."), `${basename(root)}-${safe}-${suffix++}`)
-        await git(cwd, ["worktree", "add", "-b", arg(branch), path, arg(base)])
+        // An existing branch is attached rather than recreated; git still refuses one another work tree holds.
+        const known = await git(cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${arg(branch)}`]).then((out) => out.trim() !== "", () => false)
+        await git(cwd, known ? ["worktree", "add", path, arg(branch)] : ["worktree", "add", "-b", arg(branch), path, arg(base)])
         return { path }
       }, true),
+
+    worktreeRemove: async ({ cwd, path, force }: { cwd: string; path: string; force: boolean }) => {
+      const found = await factsOf(cwd)
+      if (!found) throw new Error("This directory is not a git work tree.")
+      if (found.mainRoot === path) throw new Error("The main checkout cannot be removed as a worktree.")
+      // Queued and announced against the main checkout: git refuses to remove the tree it runs from, and the folder
+      // this call was addressed to stops existing, so nothing may watch it afterwards.
+      return mutate(found.mainRoot, () => git(found.mainRoot, ["worktree", "remove", ...(force ? ["--force"] : []), arg(path)]), true)
+    },
 
     checkoutMrs: ({ cwd, mr }: { cwd: string; mr: MergeRequestForCheckout }) =>
       mutate(cwd, async () => {

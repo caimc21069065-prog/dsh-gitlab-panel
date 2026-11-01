@@ -29,8 +29,29 @@ import { run, type Log } from "./exec"
 const META_TTL = 5 * 60_000
 const INBOX_TTL = 60_000
 const RUNS_TTL = 15_000
+const THREADS_TTL = 20_000
 const LOG_LIMIT = 400_000
 const TOKEN_TTL = 30 * 60_000
+
+/** Bound one host cache, so a long-lived process does not grow without end. */
+function keep<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
+  cache.set(key, value)
+  if (cache.size <= limit) return
+  for (const old of cache.keys()) {
+    if (cache.size <= limit) break
+    cache.delete(old)
+  }
+}
+
+/**
+ * GitLab's `labels` field is one comma-separated string, so a label whose own name holds a comma cannot be sent back:
+ * it would arrive as two labels and quietly rewrite the item's whole set. Refuse rather than corrupt it.
+ */
+function labelList(labels: readonly string[]) {
+  const broken = labels.find((label) => label.includes(","))
+  if (broken) throw new Error(`The label "${broken}" contains a comma, which GitLab's comma-separated labels field cannot carry.`)
+  return labels.join(",")
+}
 
 export interface GitLabDeps {
   log: Log
@@ -59,12 +80,16 @@ export function createGitLab(deps: GitLabDeps) {
   const viewerCache = new Map<string, Promise<Viewer>>()
   const metaCache = new Map<string, { at: number; value: Promise<RepoMeta> }>()
   const filesCache = new Map<string, Promise<ChangedFile[]>>()
-  const threadsCache = new Map<string, Promise<Reviews>>()
+  const threadsCache = new Map<string, { at: number; value: Promise<Reviews> }>()
   const inboxCache: { at: number; value: Promise<Inbox> } = { at: 0, value: Promise.resolve(emptyInbox()) }
   const runsCache = new Map<string, { at: number; value: Promise<Run[]> }>()
   const finishedCache = new Map<string, Promise<RunDetails>>()
   const logsCache = new Map<string, Promise<string>>()
   const tokenCache = new Map<string, { at: number; value: Promise<string | null> }>()
+  /** Inline comments already posted for one draft review, so a retry after a partial failure does not duplicate them. */
+  const postedCache = new Map<string, Set<string>>()
+  /** Writes waiting their turn on one item, so a read-modify-write cannot be clobbered by another running beside it. */
+  const writes = new Map<string, Promise<unknown>>()
 
   const headersFor = (token: string | null) => ({
     "PRIVATE-TOKEN": token ?? "",
@@ -104,7 +129,7 @@ export function createGitLab(deps: GitLabDeps) {
       })
       if (response.status === 401) tokenCache.delete(remote.host)
       const text = await response.text()
-      if (!response.ok) throw new Error(gitlabError(path, response.status, response.statusText, text))
+      if (!response.ok) throw new Error(gitlabError(path, response.status, response.statusText, text, retryAfterOf(response.headers)))
       return { data: text ? JSON.parse(text) : null, headers: response.headers }
     }
     return glabPage(remote, path, init)
@@ -244,8 +269,9 @@ export function createGitLab(deps: GitLabDeps) {
   }
 
   const changes = async (remote: Remote, iid: number, head?: string): Promise<ChangedFile[]> => {
-    const key = `${apiBaseOf(remote)}/${remote.path}!${iid}@${head ?? ""}`
-    const known = filesCache.get(key)
+    // Only a known head is immutable enough to remember; without one the merge request moves on.
+    const key = head ? `${apiBaseOf(remote)}/${remote.path}!${iid}@${head}` : null
+    const known = key ? filesCache.get(key) : undefined
     if (known) return known
     const value = request<Json>(remote, `/projects/${projectId(remote)}/merge_requests/${iid}/changes`).then((data) => {
       const list: Json[] = Array.isArray(data?.changes) ? data.changes : []
@@ -262,12 +288,14 @@ export function createGitLab(deps: GitLabDeps) {
         }
       })
     })
-    filesCache.set(key, value)
-    value.catch(() => filesCache.delete(key))
+    if (key) {
+      keep(filesCache, key, value, 100)
+      value.catch(() => filesCache.delete(key))
+    }
     return value
   }
 
-  const readThreads = async (remote: Remote, iid: number, head: string, files: ChangedFile[]): Promise<Reviews> => {
+  const readThreads = async (remote: Remote, iid: number, head: string, files: ChangedFile[], author?: string): Promise<Reviews> => {
     const [discussions, approvals, me] = await Promise.all([
       allPages<Json>(remote, `/projects/${projectId(remote)}/merge_requests/${iid}/discussions`).catch(() => []),
       approveState(remote, iid).catch(() => ({ approvedBy: [], review: null, requested: [] })),
@@ -307,7 +335,8 @@ export function createGitLab(deps: GitLabDeps) {
       body: "",
       submitted: null,
     }))
-    return { reviews, threads, mine: false }
+    // GitLab refuses to approve or request changes on your own merge request; the panel disables both when it knows.
+    return { reviews, threads, mine: !!me && !!author && me.username === author }
   }
 
   const remoteCommit = async (repo: Remote, sha: string): Promise<RemoteCommit> => {
@@ -399,7 +428,7 @@ export function createGitLab(deps: GitLabDeps) {
     const path = kind === "mr" ? `/projects/${projectId(remote)}/merge_requests` : `/projects/${projectId(remote)}/issues`
     const result = await requestPage(remote, path, {
       query: {
-        ...parsed.params,
+        ...(await forViewer(remote, parsed.params)),
         search: parsed.search || undefined,
         per_page: String(Math.min(100, Math.max(1, Math.floor(limit) || 30))),
         page: String(page),
@@ -407,13 +436,24 @@ export function createGitLab(deps: GitLabDeps) {
     })
     const data: Json[] = Array.isArray(result.data) ? result.data : []
     const headers = result.headers
-    const total = Number(headers.get("x-total") ?? data.length)
-    const next = headers.get("x-next-page") || String(page + 1)
+    const perPage = Math.min(100, Math.max(1, Math.floor(limit) || 30))
+    // GitLab omits x-total on big projects and the glab fallback has no headers at all, so x-next-page decides when it is there.
+    const rawTotal = headers.get("x-total")
+    const total = rawTotal === null ? (page - 1) * perPage + data.length : Number(rawTotal)
+    const next = headers.get("x-next-page")
+    const more = next === null ? data.length >= perPage : next.trim() !== ""
     return {
       total,
       items: data.map((raw) => toSearchItem(remote, raw, kind)),
-      cursor: data.length > 0 && page * Math.min(100, Math.max(1, limit || 30)) < Math.max(total, data.length) ? next : null,
+      cursor: data.length > 0 && more ? next || String(page + 1) : null,
     }
+  }
+
+  /** GitLab's `*_username` params take a literal name, so `@me` becomes the signed-in user's before the request. */
+  const forViewer = async (remote: Remote, params: Record<string, string>) => {
+    if (!Object.values(params).some((value) => value === "@me")) return params
+    const me = await viewer(remote)
+    return Object.fromEntries(Object.entries(params).map(([key, value]) => [key, value === "@me" ? me.username : value]))
   }
 
   const currentRemoteCache: { value?: Remote } = {}
@@ -478,18 +518,6 @@ export function createGitLab(deps: GitLabDeps) {
       } catch (error) {
         return { error: message(error), items: [] }
       }
-    },
-
-    mrChecks: async ({ repo, numbers }: { repo: string; numbers: readonly number[] }) => {
-      const remote = remoteFor(repo)
-      const wanted = [...new Set(numbers)].slice(0, 50)
-      const output = await Promise.all(
-        wanted.map(async (iid) => {
-          const raw = await request<Json>(remote, `/projects/${projectId(remote)}/merge_requests/${iid}`).catch(() => null)
-          return { number: iid, checks: checkState(raw?.head_pipeline?.status) }
-        }),
-      )
-      return output
     },
 
     item: async ({ repo, number, kind }: { repo: string; number: number; kind?: ItemKind }): Promise<Item> => {
@@ -616,7 +644,7 @@ export function createGitLab(deps: GitLabDeps) {
         if (input.body !== undefined) fields.description = input.body
         const currentLabels: string[] = (raw.labels ?? []).map((label: Json) => (typeof label === "string" ? label : label.name))
         if (input.addLabels.length > 0 || input.removeLabels.length > 0) {
-          fields.labels = [...new Set([...currentLabels.filter((label) => !input.removeLabels.includes(label)), ...input.addLabels])].join(",")
+          fields.labels = labelList([...new Set([...currentLabels.filter((label) => !input.removeLabels.includes(label)), ...input.addLabels])])
         }
         const currentAssignees: number[] = (raw.assignees ?? []).map((user: Json) => Number(user.id))
         if (input.addAssignees.length > 0 || input.removeAssignees.length > 0) {
@@ -669,10 +697,11 @@ export function createGitLab(deps: GitLabDeps) {
       const item = await request<Json>(remote, `/projects/${projectId(remote)}/merge_requests/${number}`)
       const head = item.diff_refs?.head_sha ?? item.sha ?? ""
       const key = `${apiBaseOf(remote)}/${remote.path}!${number}@${head}`
+      // Discussions change under a fixed head, so this expires; the Refresh button has to be able to see that.
       const cached = threadsCache.get(key)
-      if (cached) return cached
-      const value = changes(remote, number, head).then((files) => readThreads(remote, number, head, files))
-      threadsCache.set(key, value)
+      if (cached && Date.now() - cached.at < THREADS_TTL) return cached.value
+      const value = changes(remote, number, head).then((files) => readThreads(remote, number, head, files, item.author?.username))
+      keep(threadsCache, key, { at: Date.now(), value }, 50)
       value.catch(() => threadsCache.delete(key))
       return value
     },
@@ -736,30 +765,44 @@ export function createGitLab(deps: GitLabDeps) {
     createReview: async (input: { repo: string; number: number; sha: string; event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; body: string; comments: { path: string; line: number; side: "LEFT" | "RIGHT"; startLine: number | null; body: string }[] }) => {
       const remote = remoteFor(input.repo)
       return change(input.repo, input.number, async () => {
-        const mr = await request<Json>(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}`)
+        const path = `/projects/${projectId(remote)}/merge_requests/${input.number}`
+        const mr = await request<Json>(remote, path)
         const refs = mr.diff_refs ?? {}
+        const head = input.sha || refs.head_sha
+        // GitLab has no single "submit review" call, so this posts one request per part. A failure leaves the
+        // earlier parts posted and the draft alive; stamping them keeps the user's retry from duplicating them.
+        const key = `${remote.path}!${input.number}@${head}`
+        const posted = postedCache.get(key) ?? new Set<string>()
+        keep(postedCache, key, posted, 50)
+        const once = async (stamp: string, send: () => Promise<unknown>) => {
+          if (posted.has(stamp)) return
+          await send()
+          posted.add(stamp)
+        }
         for (const comment of input.comments) {
           const position = {
             position_type: "text",
             base_sha: refs.base_sha,
             start_sha: refs.start_sha,
-            head_sha: input.sha || refs.head_sha,
+            head_sha: head,
             new_path: comment.path,
             old_path: comment.path,
+            // GitLab REST positions carry one line, so a range comment lands on its last line.
             ...(comment.side === "RIGHT" ? { new_line: comment.line } : { old_line: comment.line }),
           }
-          await request(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}/discussions`, { method: "POST", body: { body: comment.body, position } })
+          await once(`${comment.path}\u0000${comment.side}\u0000${comment.line}\u0000${comment.body}`, () =>
+            request(remote, `${path}/discussions`, { method: "POST", body: { body: comment.body, position } }))
         }
         if (input.event === "REQUEST_CHANGES") {
-          await request(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}/unapprove`, { method: "POST" }).catch(() => undefined)
-          await request(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}/notes`, {
-            method: "POST",
-            body: { body: input.body.trim() ? `**Changes requested**\n\n${input.body}` : "**Changes requested.**" },
-          })
+          await request(remote, `${path}/unapprove`, { method: "POST" }).catch(() => undefined)
+          await once(`note\u0000${input.body}`, () =>
+            request(remote, `${path}/notes`, { method: "POST", body: { body: input.body.trim() ? `**Changes requested**\n\n${input.body}` : "**Changes requested.**" } }))
         } else {
-          if (input.body.trim()) await request(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}/notes`, { method: "POST", body: { body: input.body } })
-          if (input.event === "APPROVE") await request(remote, `/projects/${projectId(remote)}/merge_requests/${input.number}/approve`, { method: "POST" }).catch(() => undefined)
+          if (input.body.trim()) await once(`note\u0000${input.body}`, () => request(remote, `${path}/notes`, { method: "POST", body: { body: input.body } }))
+          // A refused approval (your own merge request, an approval rule) is the user's to know about.
+          if (input.event === "APPROVE") await once("approve", () => request(remote, `${path}/approve`, { method: "POST" }))
         }
+        postedCache.delete(key)
         return mr.web_url ?? `${remote.web}/-/merge_requests/${input.number}`
       })
     },
@@ -772,7 +815,7 @@ export function createGitLab(deps: GitLabDeps) {
       const value = request<Json[]>(remote, `/projects/${projectId(remote)}/pipelines`, {
         query: { ref: branch ?? undefined, per_page: "30", order_by: "updated_at", sort: "desc" },
       }).then((data) => data.map((raw) => toRun(remote, raw)))
-      runsCache.set(key, { at: Date.now(), value })
+      keep(runsCache, key, { at: Date.now(), value }, 50)
       value.catch(() => runsCache.delete(key))
       return value
     },
@@ -790,7 +833,7 @@ export function createGitLab(deps: GitLabDeps) {
         run: toRun(remote, pipeline),
         jobs: jobs.map((job) => toJob(remote, job)),
       }
-      if (["success", "failed", "canceled", "skipped"].includes(String(pipeline.status))) finishedCache.set(key, Promise.resolve(details))
+      if (["success", "failed", "canceled", "skipped"].includes(String(pipeline.status))) keep(finishedCache, key, Promise.resolve(details), 50)
       return details
     },
 
@@ -815,7 +858,8 @@ export function createGitLab(deps: GitLabDeps) {
         .replace(/^section_(?:start|end):\d+:[^\n]*\n?/gm, "")
       const text = output.length > LOG_LIMIT ? `… (${Math.round((output.length - LOG_LIMIT) / 1024)} KB earlier output omitted)\n${output.slice(-LOG_LIMIT)}` : output
       const finished = await request<Json>(remote, `/projects/${projectId(remote)}/jobs/${job}`).catch(() => null)
-      if (finished && ["success", "failed", "canceled", "skipped"].includes(String(finished.status))) logsCache.set(key, Promise.resolve(text))
+      // A log is up to LOG_LIMIT bytes, so this stays the smallest bound.
+      if (finished && ["success", "failed", "canceled", "skipped"].includes(String(finished.status))) keep(logsCache, key, Promise.resolve(text), 20)
       return text
     },
 
@@ -866,10 +910,11 @@ export function createGitLab(deps: GitLabDeps) {
     markRead: async ({ thread }: { thread: number | null }) => {
       const remote = currentRemote()
       try {
-        await request(remote, thread ? `/todos/${thread}/mark_as_done` : "/todos/mark_as_done", { method: "POST" })
+        // GitLab spells the two forms differently: one todo, or every pending one.
+        await request(remote, thread ? `/todos/${thread}/mark_as_done` : "/todos/mark_all_as_done", { method: "POST" })
         return ""
       } finally {
-        inboxCache.value = Promise.resolve(emptyInbox())
+        inboxCache.at = 0
         deps.inboxChanged()
       }
     },
@@ -959,7 +1004,7 @@ export function createGitLab(deps: GitLabDeps) {
           const raw = await request<Json>(remote, path)
           const current: string[] = (raw.labels ?? []).map((label: Json) => (typeof label === "string" ? label : label.name))
           const labels = [...new Set([...current.filter((label) => !remove.includes(label)), ...add])]
-          await request(remote, path, { method: "PUT", body: { labels: labels.join(",") } })
+          await request(remote, path, { method: "PUT", body: { labels: labelList(labels) } })
         } else {
           const raw = await request<Json>(remote, path)
           const current: number[] = (raw.assignees ?? []).map((user: Json) => Number(user.id))
@@ -974,11 +1019,15 @@ export function createGitLab(deps: GitLabDeps) {
       const remote = remoteFor(repo)
       return change(repo, number, async () => {
         const path = `/projects/${projectId(remote)}/${kind === "issue" ? "issues" : "merge_requests"}/${number}`
-        if (kind === "issue" && reason === "duplicate" && duplicateOf)
-          await request(remote, `${path}/notes`, { method: "POST", body: { body: `Duplicate of #${duplicateOf}` } })
+        // GitLab has no duplicate-of field, so this note is what marks the duplicate; undo has to be able to take it back.
+        const duplicate = kind === "issue" && reason === "duplicate" && duplicateOf
+          ? await request<Json>(remote, `${path}/notes`, { method: "POST", body: { body: `Duplicate of #${duplicateOf}` } })
+          : undefined
         await request(remote, path, { method: "PUT", body: { state_event: "close" } })
         if (kind === "issue") setReason(repo, number, reason)
-        return {}
+        return duplicate
+          ? { commentId: Number(duplicate.id), url: `${remote.web}/-/issues/${number}#note_${duplicate.id}` }
+          : {}
       })
     },
 
@@ -1030,14 +1079,38 @@ export function createGitLab(deps: GitLabDeps) {
     remoteCache.set(remote.path, remote)
   }
 
+  /**
+   * GitLab assigns by user id, so every name has to resolve. One that resolves to nobody is an error, not a dropped
+   * entry: silently writing back the ids that did resolve reports a change that was never made.
+   */
   async function userIds(remote: Remote, names: readonly string[]): Promise<number[]> {
     const me = names.includes("@me") ? await viewer(remote) : null
-    const members = await allPages<Json>(remote, `/projects/${projectId(remote)}/members/all`).catch(() => [])
-    return names.flatMap((name) => {
-      if (name === "@me") return me ? [me.id] : []
-      const found = members.find((member) => String(member.username).toLowerCase() === name.replace(/^@/, "").toLowerCase())
-      return found ? [Number(found.id)] : []
-    })
+    const members = await allPages<Json>(remote, `/projects/${projectId(remote)}/members/all`).then(
+      (list) => list as Json[] | undefined,
+      () => undefined,
+    )
+    const ids: number[] = []
+    for (const name of names) {
+      if (name === "@me") {
+        if (!me) throw new Error("Could not read the signed-in GitLab user.")
+        ids.push(me.id)
+        continue
+      }
+      const wanted = name.replace(/^@/, "").toLowerCase()
+      const member = members?.find((entry) => String(entry.username).toLowerCase() === wanted)
+      if (member) {
+        ids.push(Number(member.id))
+        continue
+      }
+      const user = (await allPages<Json>(remote, "/users", { username: wanted }).catch(() => [])).find(
+        (entry) => String(entry.username).toLowerCase() === wanted,
+      )
+      if (!user) throw new Error(`GitLab has no user "@${wanted}".`)
+      // The member list could be read and this name is not in it, so GitLab would refuse the write anyway.
+      if (members) throw new Error(`"@${wanted}" is not a member of this project, so it cannot be assigned.`)
+      ids.push(Number(user.id))
+    }
+    return ids
   }
 
   async function milestoneId(remote: Remote, title: string) {
@@ -1048,13 +1121,19 @@ export function createGitLab(deps: GitLabDeps) {
   }
 
   async function change<T>(repo: string, number: number, work: () => Promise<T>): Promise<T> {
+    const key = `${repo}#${number}`
+    const queued = writes.get(key) ?? Promise.resolve()
+    // `edit` reads an item's labels and assignees before writing them back, so two edits running together would each
+    // overwrite what the other had just set. The queued promise never rejects, so a failure does not stall the next.
+    const next = queued.then(work, work)
+    keep(writes, key, next.catch(() => undefined), 100)
     try {
-      return await work()
+      return await next
     } finally {
-      const remote = remoteCache.get(repo)
-      filesCache.forEach((_, key) => { if (key.includes(`/${repo}!${number}@`)) filesCache.delete(key) })
-      threadsCache.forEach((_, key) => { if (key.includes(`/${repo}!${number}@`)) threadsCache.delete(key) })
-      finishedCache.delete(remote ? `${remote.path}#${number}` : "")
+      filesCache.forEach((_, entry) => { if (entry.includes(`/${repo}!${number}@`)) filesCache.delete(entry) })
+      threadsCache.forEach((_, entry) => { if (entry.includes(`/${repo}!${number}@`)) threadsCache.delete(entry) })
+      // `finishedCache` and `logsCache` are keyed by pipeline and job id, which share no space with an item iid;
+      // rerun and retry own their eviction.
       deps.itemChanged(repo, number)
     }
   }
@@ -1113,7 +1192,7 @@ function apiBaseGuess(config: { apiBase?: string; host?: string }) {
   return (config.apiBase || `https://${config.host ?? "gitlab.com"}`).replace(/\/$/, "").replace(/\/api\/v4$/, "")
 }
 
-function gitlabError(path: string, status: number, statusText: string, text: string) {
+function gitlabError(path: string, status: number, statusText: string, text: string, retryAfter?: number) {
   let detail = text
   try {
     const parsed = JSON.parse(text) as { message?: unknown; error?: unknown }
@@ -1123,7 +1202,22 @@ function gitlabError(path: string, status: number, statusText: string, text: str
   }
   if (status === 401) return "GitLab rejected the token. Set GITLAB_TOKEN (a personal access token with api scope) or run `glab auth login`."
   if (status === 404) return `GitLab: ${detail.slice(0, 500) || statusText} (HTTP 404)`
-  return `GitLab: ${detail.slice(0, 500) || statusText} (HTTP ${status})`
+  // `backoff` reads the wait out of this text, so a throttled write waits what GitLab asked for.
+  return `GitLab: ${detail.slice(0, 500) || statusText} (HTTP ${status})${retryAfter === undefined ? "" : ` retry-after: ${retryAfter}`}`
+}
+
+/** Seconds a throttled response asks for, from Retry-After or GitLab's RateLimit-Reset. */
+function retryAfterOf(headers: Headers): number | undefined {
+  const after = headers.get("retry-after")
+  if (after) {
+    const seconds = Number(after)
+    if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds)
+    const at = Date.parse(after)
+    if (Number.isFinite(at)) return Math.max(1, Math.ceil((at - Date.now()) / 1000))
+  }
+  const reset = Number(headers.get("ratelimit-reset"))
+  if (Number.isFinite(reset) && reset > 0) return Math.max(1, Math.ceil(reset - Date.now() / 1000))
+  return undefined
 }
 
 /** The token `glab auth login` stored for a host, from the CLI's YAML config. */

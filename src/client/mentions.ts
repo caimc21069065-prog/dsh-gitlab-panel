@@ -1,18 +1,13 @@
 import { findRefs, parseGitLabLink } from "../shared/core"
 import type { ItemKind } from "../shared/types"
 import { api } from "./api"
+import { t } from "./i18n"
 import { nav } from "./nav"
 
 let currentRepo: string | undefined
 
 export function setCurrentRepo(repo: string | undefined) {
   currentRepo = repo
-}
-
-interface Overlay {
-  element: HTMLAnchorElement
-  repo: string
-  number: number
 }
 
 const SKIP = "a, pre, code, textarea, input, select, script, style, [contenteditable='true'], [data-glp], .glp-mention-overlay, .glp-portal"
@@ -23,12 +18,10 @@ export function installMentions() {
   layer.dataset.glp = ""
   layer.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147482998"
   document.body.appendChild(layer)
-  let overlays: Overlay[] = []
   let card: HTMLDivElement | undefined
   let timer = 0
 
   const clear = () => {
-    overlays = []
     layer.textContent = ""
   }
 
@@ -90,7 +83,6 @@ export function installMentions() {
               void open(repo, ref.number, ref.kind)
             })
             layer.appendChild(spot)
-            overlays.push({ element: spot, repo, number: ref.number })
             count++
           }
         }
@@ -132,9 +124,9 @@ export function installMentions() {
         meta.textContent = `${item.state.toLowerCase()} · @${item.author}${item.draft ? " · draft" : ""}`
         const hint = document.createElement("div")
         hint.style.cssText = "font-size:10px;color:var(--glp-text-3)"
-        hint.textContent = "Click to open in the GitLab panel"
+        hint.textContent = t("Click to open in the GitLab panel")
         box.append(title, meta, hint)
-        box.addEventListener("click", () => void open(repo, number))
+        box.addEventListener("click", () => void open(repo, number, item.kind))
         element.appendChild(box)
         const rect = anchor.getBoundingClientRect()
         const top = rect.bottom + 6 + 120 > window.innerHeight ? Math.max(6, rect.top - 130) : rect.bottom + 6
@@ -171,7 +163,7 @@ export function installMentions() {
       if (!link) return
       event.preventDefault()
       event.stopPropagation()
-      if (link.kind === "item") void open(link.repo, link.number)
+      if (link.kind === "item") void open(link.repo, link.number, link.item)
       else if (link.kind === "commit") nav.openCommit({ repo: link.repo, sha: link.sha })
       else if (link.kind === "run") nav.openRun({ repo: link.repo, id: link.id })
       return
@@ -203,6 +195,5 @@ export function installMentions() {
     window.clearTimeout(timer)
     hideCard()
     layer.remove()
-    overlays = []
   }
 }

@@ -53,7 +53,6 @@ export const api = {
   mergedBranches: (cwd: string) => rpc<string[]>("mergedBranches", { cwd }),
   outgoing: (cwd: string) => rpc<{ unpushed: Commit[]; base: string | null; ahead: number }>("outgoing", { cwd }),
   search: (repo: string, kind: ItemKind, query: string, cursor: string | null) => rpc<SearchPage>("search", { repo, kind, query, cursor }),
-  mrChecks: (repo: string, numbers: number[]) => rpc<{ number: number; checks: string }[]>("mrChecks", { repo, numbers }),
   item: (repo: string, number: number, kind?: ItemKind) => rpc<Item>("item", { repo, number, kind }),
   files: (repo: string, number: number, head?: string) => rpc<ChangedFile[]>("files", { repo, number, head }),
   reviews: (repo: string, number: number) => rpc<Reviews>("reviews", { repo, number }),
@@ -400,18 +399,21 @@ export function useInvalidate() {
 export interface StartSessionInput {
   cwd: string
   prompt: string
-  title?: string
   open?: boolean
+  /**
+   * Runs once the session exists but before its first prompt is sent. Metadata that the agent's own first proposals
+   * are stamped with has to be in place by then, or those proposals are recorded without it.
+   */
+  before?: (sessionID: string) => Promise<void>
 }
 
 export async function startAgentSession(input: StartSessionInput): Promise<string> {
-  const ctx = pluginCtx()
-  const remote = ctx.remote?.session
-  if (!remote?.create || !remote?.prompt) throw new Error("This DeepSeek Harness build cannot create sessions from a plugin.")
-  const created = await remote.session.create({ cwd: input.cwd })
+  const session = sessionRemote()
+  const created = await session.create({ cwd: input.cwd })
   if (!created?.ok) throw new Error(created?.error?.message ?? "Could not create the session.")
   const sessionID = created.value.sessionId
-  const sent = await remote.session.prompt({
+  if (input.before) await input.before(sessionID)
+  const sent = await session.prompt({
     requestId: crypto.randomUUID(),
     sessionId: sessionID,
     mode: "queue",
@@ -419,50 +421,84 @@ export async function startAgentSession(input: StartSessionInput): Promise<strin
     clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   })
   if (!sent?.ok) throw new Error(sent?.error?.message ?? "Could not send the first prompt.")
-  if (input.open !== false) {
-    try {
-      ctx.uiWorkspace?.openSession?.(sessionID)
-    } catch {
-      // The session exists even when navigation is unavailable.
-    }
-  }
+  if (input.open !== false) openSession(sessionID)
   return sessionID
 }
 
 export async function openSessionAt(cwd: string): Promise<string> {
-  const ctx = pluginCtx()
-  const remote = ctx.remote?.session
-  if (!remote?.create) throw new Error("This DeepSeek Harness build cannot create sessions from a plugin.")
-  const created = await remote.session.create({ cwd })
+  const session = sessionRemote()
+  const created = await session.create({ cwd })
   if (!created?.ok) throw new Error(created?.error?.message ?? "Could not create the session.")
-  ctx.uiWorkspace?.openSession?.(created.value.sessionId)
+  openSession(created.value.sessionId)
   return created.value.sessionId
 }
 
-export async function sendToChat(sessionID: string, text: string): Promise<boolean> {
-  const ctx = pluginCtx()
+/** `ctx.remote.session` is a flat generated namespace: `remote.session.create`, never `remote.session.session.create`. */
+function sessionRemote(): any {
+  const remote = pluginCtx().remote?.session
+  if (!remote?.create || !remote?.prompt) throw new Error("This DeepSeek Harness build cannot create sessions from a plugin.")
+  return remote
+}
+
+function openSession(sessionID: string) {
   try {
-    const scope = ctx.sessions?.scope?.(sessionID)
-    const conversation = scope?.get?.("conversation")
-    if (conversation?.send) {
-      conversation.send(text)
-      return true
-    }
+    pluginCtx().uiWorkspace?.openSession?.(sessionID)
   } catch {
-    // Fall through to a plain prompt.
+    // The session exists even when navigation is unavailable.
+  }
+}
+
+/** The session's composer face, when the session is retained and its conversation scope is live. */
+function composerOf(sessionID: string): any {
+  try {
+    const scope = pluginCtx().sessions?.scope?.(sessionID)
+    if (!scope) return undefined
+    return scope.get?.("conversation")?.input?.for(scope)
+  } catch {
+    // `input.for` throws for a scope the conversation layer has not retained.
+    return undefined
+  }
+}
+
+export async function sendToChat(sessionID: string, text: string): Promise<boolean> {
+  const scope = pluginCtx().sessions?.scope?.(sessionID)
+  const conversation = scope?.get?.("conversation")
+  if (conversation?.send) {
+    try {
+      await conversation.send(text)
+      return true
+    } catch {
+      return false
+    }
   }
   try {
-    const remote = ctx.remote?.session
-    if (!remote?.prompt) return false
-    const sent = await remote.session.prompt({ requestId: crypto.randomUUID(), sessionId: sessionID, mode: "queue", content: [{ type: "text", text }] })
+    const sent = await sessionRemote().prompt({
+      requestId: crypto.randomUUID(),
+      sessionId: sessionID,
+      mode: "queue",
+      content: [{ type: "text", text }],
+    })
     return !!sent?.ok
   } catch {
     return false
   }
 }
 
+/** Quotes into the composer so the user still edits it before sending, as the panel's Add to chat does. */
+function quoteIntoComposer(sessionID: string, text: string): boolean {
+  const composer = composerOf(sessionID)
+  if (!composer?.insertQuote) return false
+  try {
+    if (composer.insertQuote(text) !== true) return false
+    composer.focus?.()
+    return true
+  } catch {
+    return false
+  }
+}
+
 export async function quoteToChat(sessionID: string, cwd: string, text: string) {
-  if (await sendToChat(sessionID, text)) {
+  if (quoteIntoComposer(sessionID, text) || (await sendToChat(sessionID, text))) {
     toast({ tone: "success", title: t("Added to chat") })
     return
   }
