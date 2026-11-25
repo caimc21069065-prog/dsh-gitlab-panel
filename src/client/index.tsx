@@ -17,7 +17,7 @@ import { Button, Empty, Icon, Spinner, StateIcon, Toasts } from "./ui"
 type Ctx = any
 
 export const name = "gitlab-panel"
-export const inject = ["slots", "sidebarRightTabs", "sidebarRight", "uiWorkspace"]
+export const inject = ["slots", "sidebarRightTabs", "sidebarRight", "uiWorkspace", "remote", "remote.session"]
 
 const MAIN_ID = "dsh-gitlab-panel/main"
 const ITEM_ID = "dsh-gitlab-panel/item"
