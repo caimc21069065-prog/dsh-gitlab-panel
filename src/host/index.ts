@@ -8,7 +8,7 @@ import type { ApiResponse, Overview } from "../shared/types"
 type Ctx = any
 
 export const name = "gitlab-panel"
-export const inject = ["webServer", "tools"]
+export const inject = ["webServer", "tools", "workingDirectory"]
 
 export interface Config {
   /** GitLab host, such as gitlab.com or gitlab.example.com. Read from the remote when omitted. */
